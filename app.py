@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v3.0 · 2026-11-06"
+BUILD_TAG = "v4.1 · 2026-11-08"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -111,6 +111,8 @@ JIUCAI_BASE = "https://ai2.jiucaishuo.com/api"
 EM_FLOW_HOST = "https://push2.eastmoney.com"
 EM_FLOW_DELAY_HOST = "https://push2delay.eastmoney.com"
 EM_FLOW_PATH = "/api/qt/clist/get"
+# 日线（K 线）接口主机，云端境外 IP 常被东财拒绝，失败后走腾讯/新浪兜底
+EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -126,6 +128,18 @@ _TIMEOUT_POOL = ThreadPoolExecutor(max_workers=10)
 def _call_with_timeout(fn, timeout: float, *args, **kwargs):
     future = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
     return future.result(timeout=timeout)
+
+
+def _render_plotly(fig, config: dict | None = None, key: str | None = None) -> None:
+    """统一的图表渲染入口。
+
+    新版 Streamlit 用 width="stretch"，旧版只认 use_container_width。
+    两种写法都试，避免窄屏下图表被算成 0 宽度而显示为空白。
+    """
+    try:
+        st.plotly_chart(fig, width="stretch", config=config, key=key)
+    except TypeError:
+        st.plotly_chart(fig, use_container_width=True, config=config, key=key)
 
 SW_LEVEL1 = [
     "农林牧渔", "基础化工", "钢铁", "有色金属", "电子", "汽车", "家用电器",
@@ -316,19 +330,35 @@ DEMO_BASE_FLOW = {
     "非银金融": -0.80e9,
 }
 
-SYSTEM_PROMPT = """你是一名严谨的全市场量化风控专家，视角覆盖宏观-中观-微观三层，只依据数据说话，不做情绪安慰。
-必须执行以下用户纪律：
-1. 绝不追高：单日暴涨不加仓，反而考虑倒 T 减仓。
-2. 深套防守：科技仓位没有出现放量企稳的右侧信号，绝不补仓。
-3. 分批网格：补仓必须按回撤空间分批，不能一次性打满。
-4. 铁血风控：跌破关键支撑位，无条件减半或清仓。
-输出必须严格按以下四段格式，顺序不可变：
-【宏观定性】一句话概括今日外围宏观（美元/美债/汇率/黄金）对A股与科技股的压制或利好。
-【危险预警】针对用户重仓的深套板块（半导体/通信/纳指），结合宏观和资金流给出警告，点名具体数据。
-【潜在线索】从资金流入居前且估值分位<40%的板块中挑1-2个直接点名（如医疗、券商、有色），没有就写"无"。
-【纪律提醒】结合用户可用现金，给出今日明确操作（如"外围风偏极差，建议持币观望"）。
-总字数 200 字以内。不使用"也许、或许、可以关注一下"等模糊表达。
-明确写出触发条件、价位或金额。不要解释数据来源，不要免责声明。"""
+SYSTEM_PROMPT = """# Role
+你是拥有10年宏观对冲基金经验的首席量化风控官。服务对象是一位可用资金约6万元、重仓科技（半导体/通信）深套约40%、极易情绪化操作的A股个人投资者。
+风格要求：冷酷、客观、数据驱动，绝不说模棱两可的废话，不做情绪安慰。
+
+# Workflow & Rules
+1. 宏观一票否决权：美债收益率大涨或人民币汇率急跌时，任何A股科技反弹都视为诱多，不得给出买入建议。
+2. 严防"死扛到底"：若科技ETF无量价企稳信号且资金持续流出，必须给出明确的减仓/防守警告，点名价位。
+3. 高低切寻宝：资金净流入Top5 与 极端低估（PE分位<20%）交集处的板块，才可列为"潜在线索"。
+4. 警惕价值陷阱：PE分位>80%的板块（如红利/银行/煤炭），即使资金流入，也必须提示"拥挤度过高，不建议追高"。
+5. 只使用【Context】中给出的数字，禁止编造行情、禁止预测具体点位。
+
+# Output Format（严格按此顺序，不得增删小节）
+### 【宏观定性】
+一句话总结当前宏观流动性与杠杆环境，直接给结论：利空科技 / 中性 / 宽松；并明确两融处于"出清中"还是"企稳"。
+
+### 【危险预警】
+针对深套的科技持仓，结合宏观、ETF异动、科技防线点位，给出可执行防守指令（必须含具体价位或比例）。
+
+### 【高低切雷达】
+- **避险区**：因拥挤度过高或估值极值而被资金抛弃/不宜追的板块。
+- **潜在线索**：1-2个 PE分位<20% 且资金正在流入的接力板块，必须附 PE分位与资金流入额。
+
+### 【今日执行纪律】
+3条简短、无情的操作铁律，每条都要可执行。
+
+# Constraints
+- 严禁预测具体点位，一切依据系统数据。
+- 严禁建议重仓/满仓，必须为用户保留约6万元现金安全垫。
+- 语言精炼、直击痛点，全文不超过300字。"""
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +375,24 @@ def _last_trading_day(day: date) -> date:
 def _clip_error(exc: Exception, limit: int = 120) -> str:
     text = f"{type(exc).__name__}: {exc}"
     return text[:limit]
+
+
+_NETWORK_HINTS = (
+    "proxy", "timeout", "timed out", "connection", "connect", "ssl",
+    "502", "503", "504", "ratelimit", "rate limit", "限流", "max retries",
+)
+
+
+def _friendly_error(text: str) -> str:
+    """把底层网络报错收敛成人话，避免 ProxyError 之类的堆栈直接暴露在页面上。"""
+    low = (text or "").lower()
+    if not text:
+        return "接口暂无响应"
+    if "限流" in text or "ratelimit" in low or "rate limit" in low:
+        return "东方财富接口限流，请稍后点「刷新盘中数据」"
+    if any(hint in low for hint in _NETWORK_HINTS):
+        return "网络接口超时，请点击刷新"
+    return text[:60]
 
 
 def _json_get(url: str, params: dict[str, Any], timeout: int = 15) -> Any:
@@ -495,7 +543,7 @@ def _val_row_default(item: dict[str, Any], mode: str) -> dict[str, Any]:
     }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_valuation(refresh_token: int, mode: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     universe = get_valuation_universe()
     rows: list[dict[str, Any]] = []
@@ -603,7 +651,7 @@ def _fetch_volume_ratio(code: str) -> float | None:
         return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_support(refresh_token: int, mode: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -927,7 +975,7 @@ def _fetch_flow_direct(period: str, hosts: list[str] | None = None) -> pd.DataFr
     raise last_error or ValueError("东方财富资金流不可用")
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_flow(
     period: str,
     refresh_token: int,
@@ -1020,7 +1068,7 @@ BREADTH_FALLBACK = {
 }
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_breadth(refresh_token: int, mode: str) -> dict[str, Any]:
     """涨停≈涨幅≥9.9%、跌停≈跌幅≤-9.9%（未区分20cm板块，近似值）。"""
     if mode == "demo" or ak is None:
@@ -1073,7 +1121,7 @@ def _etf_secid(code: str) -> str:
     return ("1." if code[:1] in {"5", "6"} else "0.") + code
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_etf_premium(refresh_token: int, mode: str) -> dict[str, dict[str, Any]]:
     """ETF 实时溢价率 = 现价 / IOPV - 1。失败返回空字典，标签显示"溢价 —"。"""
     if mode == "demo" or ak is None:
@@ -1237,11 +1285,11 @@ def _demo_margin_points() -> list[dict[str, Any]]:
     return points
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_margin(
     refresh_token: int, mode: str
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """两融余额每天更新一次即可，缓存 30 分钟；失败退回本地真实快照，不造假。"""
+    """两融余额每天更新一次即可，缓存 1 天；失败退回本地真实快照，不造假。"""
     if mode == "demo":
         points = _demo_margin_points()
         return points, {"source": "演示数据", "is_demo": True,
@@ -1301,6 +1349,184 @@ def margin_signal(points: list[dict[str, Any]]) -> dict[str, str]:
     return {"level": "neutral", "label": "杠杆水位平稳",
             "detail": f"近5日 {chg5:+.1f}% · 近20日 {chg20:+.1f}%。"}
 
+
+# ---- 宽基ETF异动（国家队护盘/建仓痕迹）----
+BROAD_ETF_UNIVERSE = [
+    {"name": "沪深300ETF", "code": "510300", "short": "沪深300"},
+    {"name": "上证50ETF", "code": "510050", "short": "上证50"},
+    {"name": "科创50ETF", "code": "588000", "short": "科创50"},
+]
+
+
+def _etf_anomaly_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    frame = raw.copy()
+    frame.columns = [str(col) for col in frame.columns]
+    frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce")
+    frame["成交额"] = pd.to_numeric(frame["成交额"], errors="coerce")
+    frame["涨跌幅"] = pd.to_numeric(frame["涨跌幅"], errors="coerce")
+    frame = frame.dropna(subset=["日期", "成交额"]).sort_values("日期")
+    frame["均额20"] = frame["成交额"].rolling(window=20).mean()
+    frame["放量倍数"] = frame["成交额"] / frame["均额20"]
+    frame["异动"] = (frame["放量倍数"] >= 1.5) & (frame["涨跌幅"] > 0)
+    return frame.dropna(subset=["均额20"]).reset_index(drop=True)
+
+
+def _etf_secid(code: str) -> str:
+    return ("1." if code.startswith(("5", "6", "9")) else "0.") + code
+
+
+def _fetch_etf_kline_em(code: str) -> pd.DataFrame:
+    """东方财富 K 线直连：f51 日期 / f53 收盘 / f57 成交额 / f59 涨跌幅。"""
+    params = {
+        "secid": _etf_secid(code),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "1",
+        "beg": (date.today() - timedelta(days=200)).strftime("%Y%m%d"),
+        "end": date.today().strftime("%Y%m%d"),
+        "lmt": "120",
+    }
+    data = _json_get(EM_KLINE_URL, params, timeout=12)
+    klines = ((data or {}).get("data") or {}).get("klines") or []
+    rows = []
+    for item in klines:
+        parts = str(item).split(",")
+        if len(parts) < 9:
+            continue
+        rows.append({"日期": parts[0], "收盘": parts[2], "成交额": parts[6], "涨跌幅": parts[8]})
+    return pd.DataFrame(rows)
+
+
+def _fetch_etf_kline_tencent(code: str) -> pd.DataFrame:
+    """腾讯日线兜底（云端访问海外链路更稳）；成交额用 收盘价×成交量(手)×100 估算。"""
+    symbol = ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
+    response = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{symbol},day,,,120,qfq"},
+        headers=HTTP_HEADERS,
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json().get("data", {}).get(symbol, {})
+    series = payload.get("qfqday") or payload.get("day") or []
+    rows = []
+    prev_close = None
+    for item in series:
+        if len(item) < 6:
+            continue
+        close = float(item[2])
+        volume = float(item[5])
+        pct = (close / prev_close - 1) * 100 if prev_close else 0.0
+        rows.append({"日期": item[0], "收盘": close, "成交额": close * volume * 100, "涨跌幅": pct})
+        prev_close = close
+    return pd.DataFrame(rows)
+
+
+def _fetch_etf_kline_sina(code: str) -> pd.DataFrame:
+    """新浪日线兜底（akshare 封装），成交额用 收盘价×成交量 估算。"""
+    if ak is None:
+        raise RuntimeError("AkShare 未安装")
+    symbol = ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
+    raw = _call_with_timeout(ak.fund_etf_hist_sina, 15, symbol=symbol)
+    frame = raw.rename(columns={"date": "日期", "close": "收盘", "volume": "成交量"})
+    frame["成交额"] = pd.to_numeric(frame["收盘"], errors="coerce") * pd.to_numeric(
+        frame["成交量"], errors="coerce"
+    )
+    frame["涨跌幅"] = pd.to_numeric(frame["收盘"], errors="coerce").pct_change() * 100
+    return frame[["日期", "收盘", "成交额", "涨跌幅"]]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _etf_hist_cached(code: str, refresh_token: int) -> tuple[pd.DataFrame, str]:
+    """日线多源兜底。失败时抛异常而不是返回空表，避免把超时结果缓存一整天。"""
+    errors: list[str] = []
+
+    if ak is not None:
+        try:
+            raw = _call_with_timeout(
+                ak.fund_etf_hist_em, 25,
+                symbol=code, period="daily", adjust="qfq",
+                start_date=(date.today() - timedelta(days=200)).strftime("%Y%m%d"),
+                end_date=date.today().strftime("%Y%m%d"),
+            )
+            if raw is None or len(raw) < 30:
+                raise ValueError(f"样本不足（{0 if raw is None else len(raw)} 条）")
+            return raw, "东方财富ETF日线"
+        except Exception as exc:
+            errors.append(f"东财AkShare: {_clip_error(exc, 70)}")
+
+    for label, fetcher in (
+        ("东财直连", _fetch_etf_kline_em),
+        ("腾讯日线", _fetch_etf_kline_tencent),
+        ("新浪日线", _fetch_etf_kline_sina),
+    ):
+        try:
+            raw = fetcher(code)
+            if raw is None or len(raw) < 30:
+                raise ValueError(f"样本不足（{0 if raw is None else len(raw)} 条）")
+            return raw, label
+        except Exception as exc:
+            errors.append(f"{label}: {_clip_error(exc, 60)}")
+
+    raise RuntimeError("；".join(errors)[:180] or "全部数据源不可用")
+
+
+def load_etf_anomaly(
+    code: str, refresh_token: int, mode: str
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """宽基ETF近30个交易日量价异动：放量≥1.5倍且收红。日线数据缓存1天。"""
+    if mode == "demo":
+        days = pd.bdate_range(end=_last_trading_day(date.today()), periods=60)
+        rng = pd.Series([1 + ((i * 13) % 17) / 100 for i in range(len(days))])
+        amounts = (18e8 * rng * (1 + 0.02 * pd.Series(range(len(days))).mod(7))).tolist()
+        for idx in (24, 41, 52):
+            amounts[idx] *= 1.9
+        frame = _etf_anomaly_frame(
+            pd.DataFrame({
+                "日期": days,
+                "成交额": amounts,
+                "涨跌幅": [0.8 if i % 5 else -0.6 for i in range(len(days))],
+            })
+        )
+        return frame.tail(30).reset_index(drop=True), {
+            "source": "演示数据", "is_demo": True,
+            "asof": frame["日期"].iloc[-1].strftime("%Y-%m-%d"), "errors": [],
+        }
+
+    try:
+        raw, source = _etf_hist_cached(code, refresh_token)
+        frame = _etf_anomaly_frame(raw)
+        if len(frame) < 30:
+            raise ValueError(f"可用样本不足（{len(frame)} 条）")
+        return frame.tail(30).reset_index(drop=True), {
+            "source": source, "is_demo": False,
+            "asof": frame["日期"].iloc[-1].strftime("%Y-%m-%d"), "errors": [],
+        }
+    except Exception as exc:
+        try:
+            _etf_hist_cached.clear(code, refresh_token)
+        except Exception:
+            pass
+        return pd.DataFrame(), {"source": "ETF日线暂不可用", "is_demo": False,
+                                "asof": "", "errors": [_clip_error(exc)]}
+
+
+def etf_anomaly_signal(frame: pd.DataFrame) -> dict[str, Any]:
+    if frame.empty:
+        return {"count": 0, "last": "", "label": "数据暂不可用", "level": "neutral"}
+    hits = frame[frame["异动"]]
+    last = hits["日期"].iloc[-1].strftime("%m-%d") if not hits.empty else ""
+    if hits.empty:
+        return {"count": 0, "last": "", "level": "neutral",
+                "label": "近30日无放量收红，暂未看到大资金护盘痕迹"}
+    recent = hits.tail(3)
+    biggest = recent["放量倍数"].max()
+    dates = "、".join(hits.tail(4)["日期"].dt.strftime("%m-%d"))
+    return {
+        "count": len(hits), "last": last, "level": "warn",
+        "label": f"近30日异动 {len(hits)} 次（{dates}），最近 {last}；最大放量 {biggest:.1f} 倍",
+    }
 
 
 def _flow_extremes(frame: pd.DataFrame, count: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1839,83 +2065,149 @@ def _support_context(supports: list[dict[str, Any]]) -> str:
     return "；".join(parts)
 
 
+def _ai_flow_line(frame: pd.DataFrame, valuation_rows: list[dict[str, Any]], count: int = 5) -> list[str]:
+    """资金流 Top/Bottom 与估值分位合并成一行，供 Prompt 使用。"""
+    vmap = {row["name"]: row for row in valuation_rows}
+    lines: list[str] = []
+    for _, row in frame.head(count).iterrows():
+        name = str(row["行业"])
+        vrow = vmap.get(FLOW_VALUATION_ALIAS.get(name, name)) or vmap.get(name)
+        pe_txt = f"PE分位{vrow['pct']:.0f}%" if vrow else "PE分位—"
+        pbp_txt = (
+            f"PB分位{vrow['pb_pct']:.0f}%"
+            if vrow and vrow.get("pb_pct") is not None
+            else "PB分位—"
+        )
+        lines.append(f"{name}: {float(row['净流入']) / 1e8:+.1f}亿 / {pe_txt} / {pbp_txt}")
+    return lines
+
+
+def _ai_etf_text(etf_anomalies: dict[str, tuple[pd.DataFrame, dict[str, Any]]]) -> list[str]:
+    lines = []
+    for item in BROAD_ETF_UNIVERSE:
+        frame, _meta = etf_anomalies.get(item["code"], (pd.DataFrame(), {}))
+        if frame is None or frame.empty:
+            lines.append(f"{item['name']}：数据暂不可用")
+            continue
+        sig = etf_anomaly_signal(frame)
+        if not sig["count"]:
+            lines.append(f"{item['name']}：近30日未见放量收红")
+            continue
+        lines.append(f"{item['name']}：{sig['label']}")
+    return lines
+
+
 def build_ai_prompt(
     valuation_rows: list[dict[str, Any]],
     inflow: pd.DataFrame,
     outflow: pd.DataFrame,
-    rotation: dict[str, Any],
     supports: list[dict[str, Any]],
-    opportunities: list[dict[str, Any]],
-    events: list[dict[str, Any]],
     holdings: list[dict[str, Any]],
-    resonance: dict[str, Any],
     macro: dict[str, Any],
     msignal: dict[str, str],
     consec_inflows: list[dict[str, Any]],
+    etf_anomalies: dict[str, tuple[pd.DataFrame, dict[str, Any]]],
+    margin_points: list[dict[str, Any]],
     total_capital: float,
     tech_position: float,
     cash: float,
 ) -> str:
-    valuation_text = "；".join(
-        f"{row['name']} PE {row['pe']:.1f}x（5年分位{row['pct']:.1f}%）"
-        + (f"，PB {row['pb']:.2f}（分位{row['pb_pct']:.0f}%）" if row.get("pb") is not None else "")
-        + (f"，股息率{row['dy']:.2f}%" if row.get("dy") is not None else "")
-        for row in valuation_rows
-        if row["name"] in CORE_NAMES
+    """把全市场原始表格用 Pandas 压缩成四块结构，再交给大模型。"""
+    # ---- 1. 宏观与杠杆 ----
+    tips = macro.get("tips") or {}
+    tips_txt = (
+        f"TIPS实际利率{tips['value']:.2f}%（{tips.get('chg', 0):+.2f}）"
+        if tips.get("value") is not None
+        else "TIPS实际利率暂缺"
     )
-    opportunity_text = (
-        "；".join(
-            f"{item['name']} 3日净流入{_fmt_yi(item['three_day'])}，PE分位{item['pct']:.1f}%"
-            for item in opportunities
+    macro_lines = [
+        f"美债10Y {macro['us10y']['value']:.2f}%（日变动{macro['us10y']['chg']:+.2f}%）· {tips_txt}",
+        f"美元指数{macro['dxy']['value']:.2f}（{macro['dxy']['chg']:+.2f}%）· "
+        f"离岸人民币{macro['usdcnh']['value']:.4f}（{macro['usdcnh'].get('pips', 0):+.0f}点，数值上升=贬值）",
+        f"黄金{macro['gold']['value']:.0f}美元（{macro['gold']['chg']:+.2f}%）",
+    ]
+    if margin_points:
+        latest = float(margin_points[-1]["total"])
+        base5 = float(margin_points[-6]["total"]) if len(margin_points) >= 6 else float(margin_points[0]["total"])
+        base20 = float(margin_points[-21]["total"]) if len(margin_points) >= 21 else float(margin_points[0]["total"])
+        chg5 = (latest / base5 - 1) * 100 if base5 else 0.0
+        chg20 = (latest / base20 - 1) * 100 if base20 else 0.0
+        macro_lines.append(
+            f"两融余额{latest / 1e4:,.2f}万亿，5日{chg5:+.1f}% / 20日{chg20:+.1f}%："
+            f"{margin_signal(margin_points)['label']}"
         )
-        if opportunities
-        else "无标的满足连续3日流入且估值分位低于30%"
-    )
-    event_text = "；".join(
-        f"{event['date']} {event['title']}（剩余{_event_days(event)}天）"
-        for event in events[:3]
-    )
-    holding_text = (
+    else:
+        macro_lines.append("两融余额：数据暂不可用")
+    macro_lines.append(f"宏观信号：{msignal['title']}——{msignal['text']}")
+
+    # ---- 2. 科技防线 + 科技资金状态 ----
+    defense_lines = _support_context(supports).split("；")
+    tech_names = ["电子", "通信", "计算机"]
+    tech_flow = []
+    for name in tech_names:
+        hit = inflow[inflow["行业"] == name]
+        if hit.empty:
+            hit = outflow[outflow["行业"] == name]
+        if not hit.empty:
+            tech_flow.append(f"{name} {float(hit.iloc[0]['净流入']) / 1e8:+.1f}亿")
+    if tech_flow:
+        defense_lines.append("科技资金：" + "、".join(tech_flow))
+
+    # ---- 3. 资金流 × 估值 交叉表 ----
+    infl_lines = _ai_flow_line(inflow, valuation_rows)
+    outfl_lines = _ai_flow_line(outflow, valuation_rows)
+    expensive = [r for r in valuation_rows if r["pct"] >= 80]
+    cheap = [r for r in valuation_rows if r["pct"] < 20]
+    exp_txt = "、".join(f"{r['name']}(PE分位{r['pct']:.0f}%)" for r in expensive) or "无"
+    cheap_txt = "、".join(f"{r['name']}(PE分位{r['pct']:.0f}%)" for r in cheap) or "无"
+    cheap_names = {r["name"] for r in cheap}
+    inflow_names = {
+        FLOW_VALUATION_ALIAS.get(str(row["行业"]), str(row["行业"])) for _, row in inflow.iterrows()
+    }
+    cheap_inflow = [
+        f"{c['name']}(PE分位{c['pct']:.0f}%、3日流入{_fmt_compact_yi(c['total'])})"
+        for c in consec_inflows
+        if c["pct"] is not None and c["pct"] < 20
+    ]
+    if not cheap_inflow:
+        cheap_inflow = [
+            item for item in cheap_txt.split("、")
+            if item.split("(")[0] in inflow_names
+        ]
+    if not cheap_inflow:
+        cheap_inflow = ["无（低估与资金流入未同时出现）"]
+
+    holding_txt = (
         "；".join(
-            f"{h['name']}持仓市值{h['amount']:.0f}元、成本点位{h['cost']:.2f}、现价{h['latest']:.2f}、盈亏{h['pnl_pct']:+.1f}%"
+            f"{h['name']} 成本{h['cost']:.0f}→现价{h['latest']:.0f}，盈亏{h['pnl_pct']:+.1f}%"
             for h in holdings
         )
         if holdings
-        else "未录入持仓"
+        else "未录入具体持仓"
     )
-    resonance_parts = []
-    if resonance["negatives"]:
-        resonance_text_neg = "双重利空：" + "、".join(resonance["negatives"]) + "临近且科技资金流出"
-        resonance_parts.append(resonance_text_neg)
-    if resonance["positives"]:
-        resonance_parts.append("资金与事件共振：" + "、".join(resonance["positives"]))
-    resonance_text = "；".join(resonance_parts) if resonance_parts else "无显著共振信号"
-    macro_text = (
-        f"美元指数{macro['dxy']['value']:.2f}（{macro['dxy']['chg']:+.2f}%），"
-        f"美债10Y{macro['us10y']['value']:.2f}%（{macro['us10y']['chg']:+.2f}%），"
-        f"离岸人民币{macro['usdcnh']['value']:.4f}（{macro['usdcnh'].get('pips', 0):+.0f}点），"
-        f"黄金{macro['gold']['value']:.0f}美元（{macro['gold']['chg']:+.2f}%）；"
-        f"宏观信号：{msignal['title']}——{msignal['text']}"
-    )
-    leads_text = (
-        "；".join(
-            f"{c['name']}（3日净流入{_fmt_compact_yi(c['total'])}" + (f"，分位{c['pct']:.0f}%" if c['pct'] is not None else "") + "）"
-            for c in consec_inflows
-        )
-        if consec_inflows else "无连续流入板块"
-    )
-    return f"""【账户约束】总资金{total_capital:.0f}元，科技深套约{tech_position:.0f}元，可动用现金约{cash:.0f}元。
-【我的持仓】{holding_text}。
-【今日宏观】{macro_text}。
-【估值】{valuation_text}。
-【今日资金流】流入前五：{_flow_text(inflow)}。流出前五：{_flow_text(outflow)}。
-【高低切信号】{rotation['message']}
-【机会雷达（分位<30%）】{opportunity_text}。
-【连续流入雷达】{leads_text}。
-【共振信号】{resonance_text}。
-【科技防线】{_support_context(supports)}。
-【未来事件】{event_text}。
-请按系统要求输出四段式结论（宏观定性/危险预警/潜在线索/纪律提醒），总字数不超过200字。"""
+
+    return f"""【Context】
+1. 宏观与杠杆：
+   - {macro_lines[0]}
+   - {macro_lines[1]}
+   - {macro_lines[2]}
+   - {macro_lines[3] if len(macro_lines) > 3 else "两融余额：数据暂不可用"}
+   - 宏观信号：{msignal['title']}——{msignal['text']}
+2. ETF国家队动向（近30个交易日，放量≥1.5倍且收红）：
+   - {'；'.join(_ai_etf_text(etf_anomalies))}
+3. 用户科技防线：
+   - {'；'.join(defense_lines)}
+4. 全市场资金与估值交叉表：
+   - 资金净流入Top5：{'；'.join(infl_lines) or '暂无数据'}
+   - 资金净流出Top5：{'；'.join(outfl_lines) or '暂无数据'}
+   - 极端高估警报（PE分位>80%）：{exp_txt}
+   - 极端低估洼地（PE分位<20%）：{cheap_txt}
+   - 低估且资金正在流入：{'；'.join(cheap_inflow)}
+
+【账户约束】总资金{total_capital:,.0f}元，科技深套约{tech_position:,.0f}元（约{tech_position / total_capital * 100 if total_capital else 0:.0f}%），可用现金约{cash:,.0f}元。
+【持仓明细】{holding_txt}
+
+请严格按 Output Format 输出四个小节，全文不超过300字。"""
 
 
 def build_local_conclusion(
@@ -1971,7 +2263,7 @@ def build_local_conclusion(
     if resonance["negatives"]:
         danger += f"双重利空：{resonance['negatives'][0]}临近。"
 
-    # —— 潜在线索 ——
+    # —— 高低切雷达 ——
     leads = [c for c in consec_inflows if c["pct"] is not None and c["pct"] < 40]
     if leads:
         clue = "、".join(
@@ -1983,27 +2275,32 @@ def build_local_conclusion(
         clue = f"{c['name']}（PE分位{c['pct']:.1f}%、3日流入{_fmt_yi(c['three_day'])}）——可纳入观察名单。"
     else:
         clue = "无（无板块同时满足低分位+连续流入，继续等右侧）。"
+    crowded = [r for r in valuation_rows if r["pct"] >= 80]
+    avoid = "、".join(f"{r['name']}(分位{r['pct']:.0f}%)" for r in crowded[:3]) or "无极端高估板块"
 
-    # —— 纪律提醒 ——
+    # —— 今日执行纪律 ——
     reduce_amt = tech_position * 0.2
+    below = [r["name"] for r in supports if not r["above_ma5"]]
+    rules = [
+        f"不买科技：{'、'.join(below) + '在5日线下方，' if below else ''}未见放量企稳，禁止补仓。",
+        f"科技反弹超{rebound_take_profit:.0f}%先减约{reduce_amt:,.0f}元，跌破20日支撑无条件减半。",
+        f"现金{cash:,.0f}元保持不动，不满仓、不加杠杆。",
+    ]
     if msignal["level"] == "red":
-        disc = f"外围风偏极差，建议持币观望；现金{cash:,.0f}元留作网格子弹，科技反弹超{rebound_take_profit:.0f}%减约{reduce_amt:,.0f}元。"
-    else:
-        below = [r["name"] for r in supports if not r["above_ma5"]]
-        if below:
-            disc = f"{'、'.join(below)}在5日线下方，不补仓；反弹超{rebound_take_profit:.0f}%减约{reduce_amt:,.0f}元做T，现金{cash:,.0f}元按网格待命。"
-        else:
-            disc = f"科技站上5日线但未放量，不补仓；反弹超{rebound_take_profit:.0f}%先减约{reduce_amt:,.0f}元。"
+        rules[0] = "外围风偏极差，今日科技一律不买，反弹只减不加。"
     upcoming = [e for e in events if _event_days(e) >= 0]
     if upcoming:
         nearest = min(upcoming, key=_event_days)
-        disc += f"盯防{_event_days(nearest)}天后的{nearest['title']}。"
+        rules.append(f"盯防{_event_days(nearest)}天后的{nearest['title']}，事件前不重仓。")
 
     return (
-        f"【宏观定性】{qual}\n\n"
-        f"【危险预警】{danger}\n\n"
-        f"【潜在线索】{clue}\n\n"
-        f"【纪律提醒】{disc}"
+        f"### 【宏观定性】\n{qual}\n\n"
+        f"### 【危险预警】\n{danger}\n\n"
+        f"### 【高低切雷达】\n"
+        f"- **避险区**：{avoid}——拥挤度过高，不建议追高。\n"
+        f"- **潜在线索**：{clue}\n\n"
+        f"### 【今日执行纪律】\n"
+        + "\n".join(f"{idx}. {rule}" for idx, rule in enumerate(rules[:3], start=1))
     )
 
 
@@ -2248,6 +2545,7 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 .margin-signal.warn { color: #94600a; }
 .margin-signal.good { color: #0d7a56; }
 .margin-signal.neutral { color: #7c8797; }
+.data-stamp { color: #97a1b1; font-size: 0.64rem; margin: 6px 0 2px 2px; line-height: 1.5; }
 .badge {
     display: inline-flex;
     align-items: center;
@@ -2413,11 +2711,14 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px; }
     .hero { padding: 14px 14px; gap: 8px; }
     .hero h1 { font-size: 0.98rem; }
-    .macro-bar { padding: 7px 8px; border-radius: 12px; }
-    .macro-grid { grid-template-columns: repeat(2, 1fr); gap: 5px; }
-    .macro-cell { padding: 4px 6px; }
-    .macro-cell .m-value { font-size: 0.82rem; }
-    .macro-signal { font-size: 0.64rem; }
+    .macro-bar { padding: 6px 7px; border-radius: 12px; }
+    .macro-grid { grid-template-columns: repeat(3, 1fr); gap: 4px; }
+    .macro-cell { padding: 3px 5px; border-radius: 6px; }
+    .macro-cell .m-name { font-size: 0.5rem; }
+    .macro-cell .m-value { font-size: 0.74rem; }
+    .macro-cell .m-chg { font-size: 0.5rem; }
+    .macro-signal { font-size: 0.62rem; padding: 5px 8px; margin-top: 5px; }
+    .macro-head { margin-bottom: 4px; }
     .section-title { font-size: 1.1rem; }
     .section-sub { font-size: 0.71rem; }
     .vtop { flex-wrap: wrap; row-gap: 2px; }
@@ -2568,10 +2869,25 @@ if "refresh_token" not in st.session_state:
     st.session_state.refresh_token = 0
 if "ai_nonce" not in st.session_state:
     st.session_state.ai_nonce = 0
+if "data_stamp" not in st.session_state:
+    st.session_state.data_stamp = None
 
-if st.sidebar.button("刷新全部数据", use_container_width=True):
+if st.sidebar.button("刷新盘中数据", use_container_width=True):
+    # 只清盘中高频缓存（资金流/涨跌家数/ETF溢价/宏观），
+    # 日更数据（估值/科技防线/两融/ETF日线）当天已有缓存时继续复用。
+    for _cached_fn in (load_flow, load_breadth, load_etf_premium, load_macro):
+        try:
+            _cached_fn.clear()
+        except Exception:
+            pass
+    st.session_state.data_stamp = None
+    st.rerun()
+
+if st.sidebar.button("全量刷新（含估值/防线）", use_container_width=True):
+    # 手动强制重拉日更数据；仅在你怀疑估值/两融数据卡住时使用
     st.session_state.refresh_token += 1
     st.session_state.ai_nonce += 1
+    st.session_state.data_stamp = None
     st.cache_data.clear()
     st.rerun()
 
@@ -2624,6 +2940,9 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
+# 数据最后更新时间占位：等重型数据加载完再填充，位置保持在标题下方
+_data_stamp_slot = st.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -2714,6 +3033,25 @@ with st.spinner("正在读取估值、资金流与科技防线…（首次约10~
         etf_premiums = premium_future.result()
         margin_points, margin_meta = margin_future.result()
 
+    # 三只宽基ETF日线并行预取（按标的分开缓存，切换时不重复请求）
+    etf_anomalies: dict[str, tuple[pd.DataFrame, dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            item["code"]: pool.submit(
+                load_etf_anomaly, item["code"], st.session_state.refresh_token, mode
+            )
+            for item in BROAD_ETF_UNIVERSE
+        }
+        for code, future in futures.items():
+            try:
+                etf_anomalies[code] = future.result()
+            except Exception as exc:
+                etf_anomalies[code] = (
+                    pd.DataFrame(),
+                    {"source": "ETF日线暂不可用", "is_demo": False,
+                     "asof": "", "errors": [_clip_error(exc)]},
+                )
+
 sw_today = _sw_frame(flow_today)
 inflow_today, outflow_today = _flow_extremes(sw_today)
 history, history_meta = get_flow_history(flow_today, flow_today_meta)
@@ -2722,6 +3060,22 @@ daily_rotation = detect_daily_rotation(sw_today)
 consec_inflows = find_consecutive_inflows(history, valuation_rows)
 opportunities, opportunity_note = find_opportunities(history, valuation_rows)
 resonance = find_resonance(events, opportunities, sw_today)
+
+# 数据最后更新时间（刷新后重置；其余切换操作读缓存，不会刷新这个时间）
+if st.session_state.get("data_stamp") is None:
+    st.session_state.data_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_stamp_bits = [f"数据最后更新时间：{st.session_state.data_stamp}"]
+if valuation_meta.get("asof"):
+    _stamp_bits.append(f"估值 {valuation_meta['asof']}")
+if flow_today_meta.get("asof"):
+    _stamp_bits.append(f"资金流 {flow_today_meta['asof']}")
+if any((valuation_meta.get("is_demo"), flow_today_meta.get("is_demo"))):
+    _stamp_bits.append("含演示数据")
+_data_stamp_slot.markdown(
+    '<div class="data-stamp">' + "　·　".join(_stamp_bits)
+    + "　·　盘中数据缓存 5 分钟，点侧边栏「刷新盘中数据」可立即更新</div>",
+    unsafe_allow_html=True,
+)
 
 # 持仓盈亏：用支撑模块的现价估算
 _price_map = {row["name"]: float(row["latest"]) for row in supports}
@@ -2767,7 +3121,7 @@ st.markdown(
 # 三栏布局
 # ---------------------------------------------------------------------------
 
-left_col, mid_col, right_col = st.columns([1.03, 1.12, 1.02], gap="large")
+left_col, mid_col, right_col = st.columns([1.1, 1.2, 1.0], gap="large")
 
 
 # ----------------------------- 01 估值水位 -------------------------------
@@ -2850,11 +3204,9 @@ with left_col:
             unsafe_allow_html=True,
         )
 
-    with st.container(border=True):
+    with st.expander("02 / UNIVERSE · 全市场扩展监控池（9 个板块 · 点击展开）", expanded=False):
         st.markdown(
             """
-<div class="section-kicker" style="margin-top:12px;">02 / UNIVERSE</div>
-<div class="section-title" style="font-size:1.08rem;">全市场扩展监控池</div>
 <div class="section-sub">金融/消费/周期/制造 · ETF 标的指数 · 近5年分位定高低</div>
 """,
             unsafe_allow_html=True,
@@ -2893,164 +3245,6 @@ with left_col:
         st.markdown("".join(ext_html), unsafe_allow_html=True)
         st.caption("监控池可在程序目录新建 watchlist.json 自行增删（格式同代码内 VALUATION_UNIVERSE）")
 
-    with st.container(border=True):
-        st.markdown(
-            """
-<div class="section-kicker" style="margin-top:12px;">RISK LINE / SUPPORT</div>
-<div class="section-title" style="font-size:1.08rem;">科技防线</div>
-<div class="section-sub">20 日低点=第一支撑；跌破后减半，支撑下 5%=硬止损</div>
-""",
-            unsafe_allow_html=True,
-        )
-        support_html = []
-        for row in supports:
-            if row["dist"] <= 0:
-                status, cls = "破位·执行减半", "broken"
-            elif row["dist"] <= 3:
-                status, cls = "贴近·盯紧", "near"
-            else:
-                status, cls = "安全", "safe"
-            vr = row.get("vol_ratio")
-            vr_txt = f"{vr:.2f}x" if vr is not None else "—"
-            if vr is not None and vr >= 1.5:
-                vr_txt += "放量"
-            elif vr is not None and vr <= 0.7:
-                vr_txt += "缩量"
-            ma20_side = "上方" if row["above_ma20"] else "下方"
-            support_html.append(
-                f"""
-<div class="support-row">
-  <span class="support-name">{row['name']}</span>
-  <span class="support-num">{row['latest']:.1f}</span>
-  <span class="support-num">{row['low20']:.1f} · {row['dist']:+.1f}%</span>
-  <span class="support-status {cls}">{status}</span>
-</div>
-<div class="support-sub">量比 {vr_txt} · MA20{ma20_side} {row['ma20_gap']:+.1f}% · MA20={row['ma20']:.1f}</div>
-"""
-            )
-        st.markdown(
-            '<div class="support-row" style="color:#8a95a5;font-size:.62rem;border-bottom:1px solid #edf1f6;">'
-            '<span>指数</span><span>现价</span><span>支撑 / 距离</span><span>状态</span></div>'
-            + "".join(support_html),
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            f"5日线：科创50 {'站上' if supports[0]['above_ma5'] else '跌破'} · "
-            f"科创芯片 {'站上' if supports[1]['above_ma5'] else '跌破'} · "
-            f"通信 {'站上' if supports[2]['above_ma5'] else '跌破'}；"
-            "未见放量右侧信号，深套仓位不补。"
-        )
-
-    with st.container(border=True):
-        st.markdown(
-            """
-<div class="section-kicker" style="margin-top:12px;">MY POSITIONS</div>
-<div class="section-title" style="font-size:1.08rem;">持仓盈亏监控</div>
-<div class="section-sub">左侧边栏录入成本点位 · 跌幅≤-8% 触发硬止损参考</div>
-""",
-            unsafe_allow_html=True,
-        )
-        if holdings and tech_drain_text:
-            st.markdown(
-                f"""
-<div class="alert-card trigger">
-  <b>⚠️ 资金抽血警告</b><br>
-  {tech_drain_text}，你的科技持仓正面临抛压，<b>请勿补仓</b>；反弹按纪律做T减仓。
-</div>
-""",
-                unsafe_allow_html=True,
-            )
-        if not holdings:
-            st.caption("未录入持仓。在左侧边栏「我的持仓」填写指数成本点位与市值后，这里会实时显示盈亏与止损信号。")
-        else:
-            holding_html = []
-            for h in holdings:
-                if h["pnl_pct"] <= -8:
-                    badge, cls = "硬止损参考 · 减半", "broken"
-                elif h["pnl_pct"] <= -3:
-                    badge, cls = "警戒", "near"
-                else:
-                    badge, cls = "正常", "safe"
-                holding_html.append(
-                    f"""
-<div class="support-row">
-  <span class="support-name">{h['name']}</span>
-  <span class="support-num">{h['pnl_pct']:+.1f}%</span>
-  <span class="support-num">{h['cost']:.0f} → {h['latest']:.0f}</span>
-  <span class="support-status {cls}">{badge}</span>
-</div>
-"""
-                )
-            st.markdown(
-                '<div class="support-row" style="color:#8a95a5;font-size:.62rem;border-bottom:1px solid #edf1f6;">'
-                '<span>持仓</span><span>盈亏</span><span>成本 → 现价</span><span>信号</span></div>'
-                + "".join(holding_html),
-                unsafe_allow_html=True,
-            )
-            total_pnl_amt = sum(h["amount"] * h["pnl_pct"] / 100 for h in holdings)
-            st.caption(f"持仓浮动盈亏估算：{total_pnl_amt:+,.0f} 元（按指数点位线性估算，仅供参考）")
-
-    with st.container(border=True):
-        st.markdown(
-            """
-<div class="section-kicker" style="margin-top:12px;">LEVERAGE / MARGIN</div>
-<div class="section-title" style="font-size:1.08rem;">全市场两融水位</div>
-<div class="section-sub">沪深两融余额近3个月 · 判断杠杆资金是否出清</div>
-""",
-            unsafe_allow_html=True,
-        )
-        if not margin_points:
-            st.caption("两融数据暂不可用（交易所/金十接口限流），不影响其他模块；稍后点右上角刷新重试。")
-        else:
-            msig = margin_signal(margin_points)
-            latest = margin_points[-1]
-            base5 = margin_points[-6]["total"] if len(margin_points) >= 6 else margin_points[0]["total"]
-            base20 = margin_points[-21]["total"] if len(margin_points) >= 21 else margin_points[0]["total"]
-            chg5 = (latest["total"] / base5 - 1) * 100 if base5 else 0.0
-            chg20 = (latest["total"] / base20 - 1) * 100 if base20 else 0.0
-            icon = "🟡" if msig["level"] == "warn" else ("🟢" if msig["level"] == "good" else "⚪")
-            st.markdown(
-                f"""
-<div class="margin-head">
-  <span class="margin-value">{latest['total']:,.0f} 亿元</span>
-  <span class="margin-chg">5日 {chg5:+.2f}% · 20日 {chg20:+.2f}%</span>
-</div>
-<div class="margin-signal {msig['level']}">{icon} {msig['label']}：{msig['detail']}</div>
-""",
-                unsafe_allow_html=True,
-            )
-            if go is not None:
-                fig = go.Figure(
-                    go.Scatter(
-                        x=pd.to_datetime([p["date"] for p in margin_points]),
-                        y=[p["total"] for p in margin_points],
-                        mode="lines",
-                        line=dict(color="#2f6fb0", width=2),
-                        hovertemplate="%{x|%m-%d}<br>两融余额 %{y:,.0f} 亿<extra></extra>",
-                    )
-                )
-                fig.update_layout(
-                    height=168,
-                    margin=dict(l=2, r=6, t=6, b=2),
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="PingFang SC, Microsoft YaHei, sans-serif", size=9, color="#4c5b70"),
-                    showlegend=False,
-                    xaxis=dict(showgrid=False, nticks=6, tickfont=dict(size=9)),
-                    yaxis=dict(showgrid=True, gridcolor="#edf1f6", tickfont=dict(size=9)),
-                )
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-            else:
-                st.line_chart(
-                    pd.DataFrame(
-                        {"date": pd.to_datetime([p["date"] for p in margin_points]),
-                         "total": [p["total"] for p in margin_points]}
-                    ).set_index("date")["total"]
-                )
-            st.caption(f"{margin_meta['source']} · {margin_meta['asof']}（每日更新，不频繁请求）")
-
-
-# ----------------------------- 02 资金流 ---------------------------------
 with mid_col:
     with st.container(border=True):
         st.markdown(
@@ -3093,13 +3287,13 @@ with mid_col:
             err = (flow_view_meta.get("errors") or [""])[0]
             st.error(
                 "⚠ 当前资金流为**演示数据**（数值固定，非真实行情），请点右上角刷新重试。"
-                + (f"　接口报错：{err[:90]}" if err else "")
+                + (f"　接口状态：{_friendly_error(err)}" if err else "")
             )
         elif unavailable:
             err = (flow_view_meta.get("errors") or [""])[0]
             st.warning(
                 "5日资金流暂不可用："
-                + (err[:110] if err else "东方财富接口无响应")
+                + _friendly_error(err)
                 + "。为避免展示假数据，本页暂不显示 5 日柱状图，请切到「今日」或稍后点右上角刷新。"
             )
         elif flow_view_meta.get("stale") and period == "5日":
@@ -3219,7 +3413,7 @@ with mid_col:
                     ),
                     bargap=0.32,
                 )
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                _render_plotly(fig, config={"displayModeBar": False}, key="flow_chart")
             else:
                 st.caption(f"{period_label}主力净流入（亿元） · 数据日期 {flow_view_meta['asof']}")
                 st.bar_chart(chart_frame.set_index("行业")["净流入"] / 1e8)
@@ -3284,55 +3478,192 @@ with mid_col:
             st.caption("暂无连续 3 日净流入的行业（样本不足或全行业轮动中）。")
 
         if "演示" in flow_view_meta.get("source", "") and mode == "auto":
-            st.caption("实时资金流接口本次未取到数据，当前图表为演示兜底；点击侧边栏“刷新全部数据”可重试。")
+            st.caption("实时资金流接口本次未取到数据，当前图表为演示兜底；点击侧边栏“刷新盘中数据”可重试。")
         elif period == "5日":
             st.caption(f"5 日资金口径 · {flow_view_meta['source']} · {flow_view_meta['asof']}")
         else:
             st.caption(f"今日资金口径 · {flow_view_meta['source']} · {flow_view_meta['asof']}")
 
 
-# ----------------------------- 03/04 事件与 AI ---------------------------
-with right_col:
     with st.container(border=True):
         st.markdown(
             """
-<div class="section-kicker">03 / EVENT COUNTDOWN</div>
-<div class="section-title">宏观与产业事件倒计时</div>
-<div class="section-sub">只保留可能引发暴涨/暴跌的硬核节点</div>
+<div class="section-kicker" style="margin-top:12px;">BROAD ETF / ANOMALY</div>
+<div class="section-title" style="font-size:1.08rem;">宽基ETF大资金异动</div>
+<div class="section-sub">放量≥1.5倍且收红 · 国家队护盘/建仓痕迹</div>
 """,
             unsafe_allow_html=True,
         )
-        event_html = []
-        for event in events[:3]:
-            days = _event_days(event)
-            if days < 0:
-                cls, day_text, day_unit, badge = "past", f"{abs(days)}", "天前", "已发生"
-            elif days <= 1:
-                cls, day_text, day_unit, badge = "urgent", f"{days}", "天", "红色预警 · 1 天内"
-            elif days <= 3:
-                cls, day_text, day_unit, badge = "warn", f"{days}", "天", "黄色提示 · 3 天内"
-            else:
-                cls, day_text, day_unit, badge = "normal", f"{days}", "天", f"距今 {days} 天"
-            event_html.append(
-                f"""
-<div class="event-card {cls}">
-  <div class="event-day">{day_text}<small>{day_unit}</small></div>
-  <div class="event-body">
-    <div class="event-meta">{event['date']} · {event['type']}</div>
-    <div class="event-title">{event['title']}</div>
-    <div class="event-impact">{event['impact']}</div>
-    <span class="event-badge">{badge}</span>
-  </div>
-</div>
-"""
+        etf_choice = st.radio(
+            "宽基ETF",
+            options=[item["short"] for item in BROAD_ETF_UNIVERSE],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="broad_etf_choice",
+        )
+        etf_item = next(
+            (item for item in BROAD_ETF_UNIVERSE if item["short"] == etf_choice),
+            BROAD_ETF_UNIVERSE[0],
+        )
+        etf_frame, etf_meta = etf_anomalies.get(
+            etf_item["code"], (pd.DataFrame(), {"source": "", "asof": "", "is_demo": False})
+        )
+        if etf_frame.empty:
+            err = (etf_meta.get("errors") or [""])[0]
+            st.error(
+                f"{etf_item['name']} 日线暂不可用：{_friendly_error(err)}。"
+                "为避免误导，本图暂不显示，其余模块不受影响。"
             )
-        st.markdown("".join(event_html), unsafe_allow_html=True)
-        st.caption("提前 3 天标黄 · 提前 1 天标红 · 可编辑 app.py 顶部或新增 events.json")
+        else:
+            esig = etf_anomaly_signal(etf_frame)
+            icon = "🔴" if esig["count"] else "⚪"
+            color = "#94600a" if esig["count"] else "#7c8797"
+            st.markdown(
+                f'<div class="margin-signal" style="color:{color};">'
+                f"{icon} {esig['label']}</div>",
+                unsafe_allow_html=True,
+            )
+            if go is not None:
+                amounts = (etf_frame["成交额"] / 1e8).round(2)
+                ma20 = (etf_frame["均额20"] / 1e8).round(2)
+                chg = etf_frame["涨跌幅"].round(2)
+                bar_colors = [
+                    "#e23b3b" if hit else "#b9c3d1" for hit in etf_frame["异动"]
+                ]
+                hover = [
+                    (
+                        f"异动：放量{row['放量倍数']:.1f}倍，涨幅{row['涨跌幅']:+.2f}%"
+                        if row["异动"]
+                        else f"{row['日期']:%m-%d} 成交额 {row['成交额'] / 1e8:.2f}亿 · 涨跌 {row['涨跌幅']:+.2f}%"
+                    )
+                    for _, row in etf_frame.iterrows()
+                ]
+                fig = go.Figure()
+                fig.add_bar(
+                    x=etf_frame["日期"], y=amounts, marker_color=bar_colors,
+                    name="成交额", text=hover, hovertemplate="%{text}<extra></extra>",
+                )
+                hit_rows = etf_frame[etf_frame["异动"]]
+                if not hit_rows.empty:
+                    # 异动柱上方直接标日期，避免不知道是哪一天
+                    fig.add_scatter(
+                        x=hit_rows["日期"], y=(hit_rows["成交额"] / 1e8) * 1.05,
+                        mode="text",
+                        text=[d.strftime("%m-%d") for d in hit_rows["日期"]],
+                        textposition="top center",
+                        textfont=dict(size=8, color="#c0392b"),
+                        showlegend=False, hoverinfo="skip",
+                    )
+                fig.add_scatter(
+                    x=etf_frame["日期"], y=ma20, mode="lines",
+                    line=dict(color="#e0a800", width=2), name="20日均额",
+                    hovertemplate="20日均额 %{y:.2f}亿<extra></extra>",
+                )
+                fig.add_scatter(
+                    x=etf_frame["日期"], y=chg, mode="lines", yaxis="y2",
+                    line=dict(color="#2f6fb0", width=1.6), name="涨跌幅",
+                    hovertemplate="涨跌幅 %{y:+.2f}%<extra></extra>",
+                )
+                fig.update_layout(
+                    height=210,
+                    margin=dict(l=2, r=2, t=26, b=2),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="PingFang SC, Microsoft YaHei, sans-serif",
+                              size=9, color="#4c5b70"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                                font=dict(size=8.5)),
+                    xaxis=dict(showgrid=False, nticks=7, tickformat="%m-%d",
+                               tickfont=dict(size=8.5)),
+                    yaxis=dict(showgrid=True, gridcolor="#edf1f6",
+                               tickfont=dict(size=8.5), title=dict(text="成交额(亿)", font=dict(size=8.5))),
+                    yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                                tickfont=dict(size=8.5), zeroline=False,
+                                title=dict(text="涨跌幅(%)", font=dict(size=8.5))),
+                )
+                _render_plotly(fig, config={"displayModeBar": False}, key="broad_etf_chart")
+            st.caption(
+                f"{etf_meta['source']} · {etf_meta['asof']} · "
+                f"{etf_item['name']}（{etf_item['code']}）近30个交易日"
+            )
+
+
 
     with st.container(border=True):
         st.markdown(
             """
-<div class="section-kicker" style="margin-top:12px;">04 / AI DECISION</div>
+<div class="section-kicker" style="margin-top:12px;">LEVERAGE / MARGIN</div>
+<div class="section-title" style="font-size:1.08rem;">全市场两融水位</div>
+<div class="section-sub">沪深两融余额近3个月 · 判断杠杆资金是否出清</div>
+""",
+            unsafe_allow_html=True,
+        )
+        if not margin_points:
+            st.caption("两融数据暂不可用（交易所/金十接口限流），不影响其他模块；稍后点右上角刷新重试。")
+        else:
+            msig = margin_signal(margin_points)
+            latest = margin_points[-1]
+            base5 = margin_points[-6]["total"] if len(margin_points) >= 6 else margin_points[0]["total"]
+            base20 = margin_points[-21]["total"] if len(margin_points) >= 21 else margin_points[0]["total"]
+            chg5 = (latest["total"] / base5 - 1) * 100 if base5 else 0.0
+            chg20 = (latest["total"] / base20 - 1) * 100 if base20 else 0.0
+            icon = "🟡" if msig["level"] == "warn" else ("🟢" if msig["level"] == "good" else "⚪")
+            st.markdown(
+                f"""
+<div class="margin-head">
+  <span class="margin-value">{latest['total']:,.0f} 亿元</span>
+  <span class="margin-chg">5日 {chg5:+.2f}% · 20日 {chg20:+.2f}%</span>
+</div>
+<div class="margin-signal {msig['level']}">{icon} {msig['label']}：{msig['detail']}</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if go is not None:
+                margin_values = [p["total"] for p in margin_points]
+                low, high = min(margin_values), max(margin_values)
+                pad = (high - low) * 0.12 or high * 0.01 or 1.0
+                fig = go.Figure(
+                    go.Scatter(
+                        x=pd.to_datetime([p["date"] for p in margin_points]),
+                        y=margin_values,
+                        mode="lines",
+                        line=dict(color="#2f6fb0", width=3),
+                        hovertemplate="%{x|%m-%d}<br>两融余额 %{y:,.0f} 亿<extra></extra>",
+                    )
+                )
+                fig.update_layout(
+                    height=210,
+                    margin=dict(l=2, r=6, t=8, b=2),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="PingFang SC, Microsoft YaHei, sans-serif", size=9, color="#4c5b70"),
+                    showlegend=False,
+                    xaxis=dict(showgrid=False, nticks=5, tickfont=dict(size=9)),
+                    yaxis=dict(
+                        showgrid=True, gridcolor="#edf1f6", tickfont=dict(size=9),
+                        range=[low - pad, high + pad],
+                    ),
+                )
+                _render_plotly(fig, config={"displayModeBar": False}, key="margin_chart")
+            else:
+                st.line_chart(
+                    pd.DataFrame(
+                        {"date": pd.to_datetime([p["date"] for p in margin_points]),
+                         "total": [p["total"] for p in margin_points]}
+                    ).set_index("date")["total"]
+                )
+            st.caption(
+                f"{margin_meta['source']} · {margin_meta['asof']}"
+                f"（{len(margin_points)} 个交易日，每日更新，不频繁请求）"
+            )
+
+# ----------------------------- 03/04 事件与 AI ---------------------------
+with right_col:
+
+    with st.container(border=True):
+        st.markdown(
+            """
+<div class="section-kicker">03 / AI DECISION</div>
 <div class="section-title" style="font-size:1.08rem;">AI 量化交易结论</div>
 <div class="section-sub">剥离情绪 · 只输出条件、价位与动作</div>
 """,
@@ -3343,15 +3674,13 @@ with right_col:
             valuation_rows=valuation_rows,
             inflow=inflow_today,
             outflow=outflow_today,
-            rotation=rotation,
             supports=supports,
-            opportunities=opportunities,
-            events=events,
             holdings=holdings,
-            resonance=resonance,
             macro=macro,
             msignal=msignal,
             consec_inflows=consec_inflows,
+            etf_anomalies=etf_anomalies,
+            margin_points=margin_points,
             total_capital=total_capital,
             tech_position=tech_position,
             cash=cash,
@@ -3419,6 +3748,141 @@ with right_col:
             ))
 
 
+    with st.container(border=True):
+        st.markdown(
+            """
+<div class="section-kicker" style="margin-top:12px;">04 / EVENT COUNTDOWN</div>
+<div class="section-title">宏观与产业事件倒计时</div>
+<div class="section-sub">只保留可能引发暴涨/暴跌的硬核节点</div>
+""",
+            unsafe_allow_html=True,
+        )
+        event_html = []
+        for event in events[:3]:
+            days = _event_days(event)
+            if days < 0:
+                cls, day_text, day_unit, badge = "past", f"{abs(days)}", "天前", "已发生"
+            elif days <= 1:
+                cls, day_text, day_unit, badge = "urgent", f"{days}", "天", "红色预警 · 1 天内"
+            elif days <= 3:
+                cls, day_text, day_unit, badge = "warn", f"{days}", "天", "黄色提示 · 3 天内"
+            else:
+                cls, day_text, day_unit, badge = "normal", f"{days}", "天", f"距今 {days} 天"
+            event_html.append(
+                f"""
+<div class="event-card {cls}">
+  <div class="event-day">{day_text}<small>{day_unit}</small></div>
+  <div class="event-body">
+    <div class="event-meta">{event['date']} · {event['type']}</div>
+    <div class="event-title">{event['title']}</div>
+    <div class="event-impact">{event['impact']}</div>
+    <span class="event-badge">{badge}</span>
+  </div>
+</div>
+"""
+            )
+        st.markdown("".join(event_html), unsafe_allow_html=True)
+        st.caption("提前 3 天标黄 · 提前 1 天标红 · 可编辑 app.py 顶部或新增 events.json")
+
+    with st.container(border=True):
+        st.markdown(
+            """
+<div class="section-kicker">RISK LINE / SUPPORT</div>
+<div class="section-title" style="font-size:1.08rem;">科技防线</div>
+<div class="section-sub">20 日低点=第一支撑；跌破后减半，支撑下 5%=硬止损</div>
+""",
+            unsafe_allow_html=True,
+        )
+        support_html = []
+        for row in supports:
+            if row["dist"] <= 0:
+                status, cls = "破位·执行减半", "broken"
+            elif row["dist"] <= 3:
+                status, cls = "贴近·盯紧", "near"
+            else:
+                status, cls = "安全", "safe"
+            vr = row.get("vol_ratio")
+            vr_txt = f"{vr:.2f}x" if vr is not None else "—"
+            if vr is not None and vr >= 1.5:
+                vr_txt += "放量"
+            elif vr is not None and vr <= 0.7:
+                vr_txt += "缩量"
+            ma20_side = "上方" if row["above_ma20"] else "下方"
+            support_html.append(
+                f"""
+<div class="support-row">
+  <span class="support-name">{row['name']}</span>
+  <span class="support-num">{row['latest']:.1f}</span>
+  <span class="support-num">{row['low20']:.1f} · {row['dist']:+.1f}%</span>
+  <span class="support-status {cls}">{status}</span>
+</div>
+<div class="support-sub">量比 {vr_txt} · MA20{ma20_side} {row['ma20_gap']:+.1f}% · MA20={row['ma20']:.1f}</div>
+"""
+            )
+        st.markdown(
+            '<div class="support-row" style="color:#8a95a5;font-size:.62rem;border-bottom:1px solid #edf1f6;">'
+            '<span>指数</span><span>现价</span><span>支撑 / 距离</span><span>状态</span></div>'
+            + "".join(support_html),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"5日线：科创50 {'站上' if supports[0]['above_ma5'] else '跌破'} · "
+            f"科创芯片 {'站上' if supports[1]['above_ma5'] else '跌破'} · "
+            f"通信 {'站上' if supports[2]['above_ma5'] else '跌破'}；"
+            "未见放量右侧信号，深套仓位不补。"
+        )
+
+    with st.container(border=True):
+        st.markdown(
+            """
+<div class="section-kicker" style="margin-top:12px;">MY POSITIONS</div>
+<div class="section-title" style="font-size:1.08rem;">持仓盈亏监控</div>
+<div class="section-sub">左侧边栏录入成本点位 · 跌幅≤-8% 触发硬止损参考</div>
+""",
+            unsafe_allow_html=True,
+        )
+        if holdings and tech_drain_text:
+            st.markdown(
+                f"""
+<div class="alert-card trigger">
+  <b>⚠️ 资金抽血警告</b><br>
+  {tech_drain_text}，你的科技持仓正面临抛压，<b>请勿补仓</b>；反弹按纪律做T减仓。
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+        if not holdings:
+            st.caption("未录入持仓。在左侧边栏「我的持仓」填写指数成本点位与市值后，这里会实时显示盈亏与止损信号。")
+        else:
+            holding_html = []
+            for h in holdings:
+                if h["pnl_pct"] <= -8:
+                    badge, cls = "硬止损参考 · 减半", "broken"
+                elif h["pnl_pct"] <= -3:
+                    badge, cls = "警戒", "near"
+                else:
+                    badge, cls = "正常", "safe"
+                holding_html.append(
+                    f"""
+<div class="support-row">
+  <span class="support-name">{h['name']}</span>
+  <span class="support-num">{h['pnl_pct']:+.1f}%</span>
+  <span class="support-num">{h['cost']:.0f} → {h['latest']:.0f}</span>
+  <span class="support-status {cls}">{badge}</span>
+</div>
+"""
+                )
+            st.markdown(
+                '<div class="support-row" style="color:#8a95a5;font-size:.62rem;border-bottom:1px solid #edf1f6;">'
+                '<span>持仓</span><span>盈亏</span><span>成本 → 现价</span><span>信号</span></div>'
+                + "".join(holding_html),
+                unsafe_allow_html=True,
+            )
+            total_pnl_amt = sum(h["amount"] * h["pnl_pct"] / 100 for h in holdings)
+            st.caption(f"持仓浮动盈亏估算：{total_pnl_amt:+,.0f} 元（按指数点位线性估算，仅供参考）")
+
+# ----------------------------- 02 资金流 ---------------------------------
+
 # ---------------------------------------------------------------------------
 # 底部说明
 # ---------------------------------------------------------------------------
@@ -3432,8 +3896,11 @@ st.markdown(
 数据链路：韭圈儿指数估值（PE/PB 近 5 年分位） · 中证指数官网（股息率） · AkShare / 东方财富（行业资金流·南向资金·全A宽度·ETF溢价率） · 新浪行情（美元/汇率/黄金） · 中债/FRED（美债名义与实际利率） · 本地事件字典。<br>
 版本 {BUILD_TAG}　｜　估值兜底快照日期 {FALLBACK_ASOF}；当实时接口不可用时页面会明确标记“演示/快照”，不会伪装成实时数据。
 事件与仓位参数可在左侧控制台及代码顶部调整。此工具用于个人研究与风险提醒，不构成投资建议。
-{f"<br>数据诊断：{diag}" if diag else ""}
 </div>
 """,
     unsafe_allow_html=True,
 )
+
+if diag:
+    with st.expander("数据诊断（接口异常详情）", expanded=False):
+        st.caption(" · ".join(_friendly_error(item) for item in diag.split(" · "))[:600])
