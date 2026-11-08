@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.1 · 2026-11-08"
+BUILD_TAG = "v4.2 · 2026-11-08"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -2024,6 +2024,76 @@ def macro_signal(macro: dict[str, Any]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+EVENTS_PROMPT_TEMPLATE = """你是一个金融日历助手。今天是 {today}，请列出未来 10-15 天内，全球和中国资本市场即将发生的重要宏观数据（如美国CPI/非农、中国LPR）、重大产业大会（如科技大会、医药大会）以及关键龙头财报（如英伟达、中芯国际）。
+只输出纯 JSON 数组，不要 Markdown 代码块、不要任何解释文字。
+每个元素包含字段：date（YYYY-MM-DD）、title、impact（一句话说明对A股/科技板块的影响）、description、type（宏观数据/产业催化/龙头财报）。
+日期必须落在 {today} 之后 15 天内，按日期升序，最多 12 条。"""
+
+
+def generate_events(api_key: str, base_url: str, model: str) -> tuple[list[dict[str, Any]], str]:
+    """调用 DeepSeek 生成未来 15 天事件日历，成功则覆盖写入 events.json。"""
+    if not api_key:
+        return [], "未配置 DeepSeek Key，无法自动生成事件日历。"
+    today = date.today()
+    try:
+        content = _chat_completion(
+            api_key, base_url, model,
+            system="你是严谨的金融日历助手，只输出合法 JSON 数组。",
+            user=EVENTS_PROMPT_TEMPLATE.format(today=today.isoformat()),
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        events = _parse_events_json(content, today)
+        if not events:
+            raise ValueError("模型未返回有效事件")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        EVENTS_FILE.write_text(
+            json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return events, ""
+    except Exception as exc:
+        return [], _friendly_error(exc)
+
+
+def _parse_events_json(text: str, today: date) -> list[dict[str, Any]]:
+    cleaned = re.sub(r"```(?:json)?", "", str(text)).strip().strip("`")
+    start, end = cleaned.find("["), cleaned.rfind("]")
+    if start < 0 or end < start:
+        raise ValueError("模型返回内容不是 JSON 数组")
+    payload = json.loads(cleaned[start:end + 1])
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in payload if isinstance(payload, list) else []:
+        if not isinstance(item, dict):
+            continue
+        day = pd.to_datetime(item.get("date"), errors="coerce")
+        title = str(item.get("title") or "").strip()
+        if pd.isna(day) or not title:
+            continue
+        day = day.date()
+        if not (today - timedelta(days=1) <= day <= today + timedelta(days=20)):
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+        events.append({
+            "date": day.isoformat(),
+            "title": title,
+            "type": str(item.get("type") or "宏观事件"),
+            "impact": str(item.get("impact") or item.get("description") or "").strip(),
+        })
+    events.sort(key=lambda row: row["date"])
+    return events[:12]
+
+
+def _events_stale(days: int = 7) -> bool:
+    try:
+        age = datetime.now().timestamp() - EVENTS_FILE.stat().st_mtime
+    except OSError:
+        return True
+    return age > days * 86400
+
+
 def load_events() -> tuple[list[dict[str, Any]], str]:
     if EVENTS_FILE.exists():
         try:
@@ -2304,13 +2374,14 @@ def build_local_conclusion(
     )
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def call_llm(
+def _chat_completion(
     api_key: str,
     base_url: str,
     model: str,
-    prompt: str,
-    nonce: int,
+    system: str,
+    user: str,
+    temperature: float = 0.15,
+    max_tokens: int = 420,
 ) -> str:
     url = base_url.rstrip("/")
     if not url.endswith("/chat/completions"):
@@ -2324,20 +2395,31 @@ def call_llm(
         json={
             "model": model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
-            "temperature": 0.15,
-            "max_tokens": 420,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
         },
         timeout=45,
     )
     response.raise_for_status()
     payload = response.json()
-    content = payload["choices"][0]["message"]["content"].strip()
+    content = (payload["choices"][0]["message"]["content"] or "").strip()
     if not content:
-        raise ValueError("模型返回空结论")
+        raise ValueError("模型返回空内容")
     return content
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def call_llm(
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    nonce: int,
+) -> str:
+    return _chat_completion(api_key, base_url, model, SYSTEM_PROMPT, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -3021,6 +3103,11 @@ with st.spinner("正在读取估值、资金流与科技防线…（首次约10~
     supports, support_meta = load_support(
         st.session_state.refresh_token, mode
     )
+    if api_key and _events_stale(7) and not st.session_state.get("events_auto_done"):
+        # 每周（文件超过 7 天）自动让 DeepSeek 重建一次事件日历，无需人工录入
+        st.session_state.events_auto_done = True
+        _, _event_err = generate_events(api_key, base_url, model)
+        st.session_state.events_auto_error = _event_err
     events, event_source = load_events()
     # 溢价率与两融互不依赖，并行取数，避免串行拖慢首屏
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -3782,7 +3869,27 @@ with right_col:
 """
             )
         st.markdown("".join(event_html), unsafe_allow_html=True)
-        st.caption("提前 3 天标黄 · 提前 1 天标红 · 可编辑 app.py 顶部或新增 events.json")
+        if event_source == "events.json":
+            _ev_age = ""
+            try:
+                _ev_age = datetime.fromtimestamp(EVENTS_FILE.stat().st_mtime).strftime("%m-%d")
+            except OSError:
+                pass
+            st.caption(f"事件日历自动更新（最后更新 {_ev_age}）· 每周一自动重建，也可手动刷新")
+        else:
+            st.caption("当前为内置事件；配置 Key 后每周自动生成，或点下方按钮立即更新")
+        if api_key:
+            if st.button("更新事件日历", use_container_width=True, key="refresh_events"):
+                with st.spinner("DeepSeek 正在生成未来 15 天事件日历…"):
+                    _new_events, _ev_err = generate_events(api_key, base_url, model)
+                if _ev_err:
+                    st.warning(_ev_err)
+                else:
+                    st.session_state.events_auto_done = True
+                    st.session_state.events_auto_error = ""
+                    st.rerun()
+        if st.session_state.get("events_auto_error"):
+            st.caption(f"自动更新失败：{st.session_state.events_auto_error}")
 
     with st.container(border=True):
         st.markdown(
