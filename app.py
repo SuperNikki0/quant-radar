@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.2 · 2026-11-08"
+BUILD_TAG = "v4.3 · 2026-11-08"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -1350,6 +1350,36 @@ def margin_signal(points: list[dict[str, Any]]) -> dict[str, str]:
             "detail": f"近5日 {chg5:+.1f}% · 近20日 {chg20:+.1f}%。"}
 
 
+def margin_alert(points: list[dict[str, Any]]) -> dict[str, str]:
+    """两融余额 + 5日变化率 → 五档定性预警（红/黄/绿/蓝）。"""
+    if len(points) < 6:
+        return {"level": "gray", "text": "两融样本不足，暂不做杠杆定性判断。"}
+    values = [float(p["total"]) for p in points]
+    latest = values[-1]
+    chg5 = (latest / values[-6] - 1) * 100 if values[-6] else 0.0
+    window = values[-5:]
+    mean5 = sum(window) / len(window)
+    swing5 = (max(window) - min(window)) / mean5 * 100 if mean5 else 99.0
+
+    if latest > 28000 and chg5 > 0:
+        return {"level": "red",
+                "text": "⚠️ 极度危险：杠杆资金极度拥挤且仍在狂奔，随时可能引发踩踏，严禁开新仓！"}
+    if latest < 18000:
+        return {"level": "green",
+                "text": "🟢 绝对地量：杠杆泡沫挤干，中长线黄金坑，逢低分批建仓。"}
+    if latest < 20000 and chg5 > 2:
+        return {"level": "blue",
+                "text": "📈 资金入场：杠杆资金开始试探性买入，情绪回暖，可跟随主力做多。"}
+    if 23000 <= latest <= 28000 and chg5 < -2:
+        return {"level": "yellow",
+                "text": "⚙️ 杠杆正在出清：资金被动平仓踩踏中，左侧勿接飞刀，死等企稳。"}
+    if -1 <= chg5 <= 1 and swing5 <= 0.25:
+        return {"level": "green",
+                "text": "✅ 杠杆出清尾声：资金抛压衰竭，底部特征明显，可开始寻找右侧机会。"}
+    return {"level": "gray",
+            "text": f"杠杆水位中性（5日{chg5:+.2f}%），未见极端信号，按既有纪律执行。"}
+
+
 # ---- 宽基ETF异动（国家队护盘/建仓痕迹）----
 BROAD_ETF_UNIVERSE = [
     {"name": "沪深300ETF", "code": "510300", "short": "沪深300"},
@@ -2627,6 +2657,15 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 .margin-signal.warn { color: #94600a; }
 .margin-signal.good { color: #0d7a56; }
 .margin-signal.neutral { color: #7c8797; }
+.margin-alert {
+    margin: 4px 0 2px; padding: 5px 9px; border-radius: 8px;
+    font-size: 0.66rem; font-weight: 650; line-height: 1.55;
+}
+.margin-alert.red { background: #fdeceb; color: #a92c2c; border-left: 3px solid #e23b3b; }
+.margin-alert.yellow { background: #fdf6e3; color: #8a5b06; border-left: 3px solid #e3a008; }
+.margin-alert.green { background: #eaf7f0; color: #0d6b4c; border-left: 3px solid #16a374; }
+.margin-alert.blue { background: #eaf1fb; color: #1f4f8f; border-left: 3px solid #2f6fb0; }
+.margin-alert.gray { background: #f4f6f9; color: #66717f; border-left: 3px solid #b7c0cc; }
 .data-stamp { color: #97a1b1; font-size: 0.64rem; margin: 6px 0 2px 2px; line-height: 1.5; }
 .badge {
     display: inline-flex;
@@ -3739,6 +3778,11 @@ with mid_col:
                          "total": [p["total"] for p in margin_points]}
                     ).set_index("date")["total"]
                 )
+            st.markdown(
+                f'<div class="margin-alert {margin_alert(margin_points)["level"]}">'
+                f'{margin_alert(margin_points)["text"]}</div>',
+                unsafe_allow_html=True,
+            )
             st.caption(
                 f"{margin_meta['source']} · {margin_meta['asof']}"
                 f"（{len(margin_points)} 个交易日，每日更新，不频繁请求）"
