@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.3 · 2026-11-08"
+BUILD_TAG = "v4.4 · 2026-11-09"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -498,6 +498,120 @@ def _fetch_jcs_series(code: str, metric: str) -> tuple[float, float, str]:
     return round(latest, 3), round(pct_5y, 2), latest_date.date().isoformat()
 
 
+def _jcs_code_to_em_secid(code: str) -> str | None:
+    """韭圈儿 code → 东财 push2 secid。海外/申万指数东财无覆盖，返回 None。"""
+    sym, _, suffix = code.partition(".")
+    if suffix in ("HI", "GI", "SI"):
+        return None  # 恒生/美股/申万行业 → 东财无对应指数，跳过滚动更新
+    if suffix == "SH":
+        return f"1.{sym}"
+    if suffix == "SZ":
+        return f"0.{sym}"
+    # CSI：看代码前缀判断沪/深
+    if suffix == "CSI":
+        if sym.startswith(("000", "51", "52", "53", "56")):
+            return f"1.{sym}"  # 沪市 ETF / 宽基
+        if sym.startswith(("399", "15", "16")):
+            return f"0.{sym}"  # 深市 ETF / 宽基
+        if sym.startswith("93"):
+            return f"0.{sym}"  # 中证行业指数多深市
+        return f"1.{sym}"  # 默认沪市
+    return f"1.{sym}"  # fallback
+
+
+def _fetch_latest_close_em(code: str) -> tuple[float, str] | None:
+    """东财 push2 拉指数最新 (收盘价, 日期ISO)。海外指数/无覆盖时返回 None。
+    
+    两层数据源：push2his 主路 → 腾讯日线兜底（腾讯不走东财 push2 限流链路，更稳）。
+    """
+    secid = _jcs_code_to_em_secid(code)
+    if secid is None:
+        return None
+
+    # ---- 主路：东财 push2his ----
+    try:
+        beg = (date.today() - timedelta(days=12)).strftime("%Y%m%d")
+        end = date.today().strftime("%Y%m%d")
+        payload = _json_get(
+            EM_KLINE_URL,
+            {
+                "secid": secid,
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101", "fqt": "1",
+                "beg": beg, "end": end, "lmt": "15",
+            },
+            timeout=10,
+        )
+        klines = ((payload or {}).get("data") or {}).get("klines") or []
+        if klines:
+            parts = klines[-1].split(",")
+            if len(parts) >= 3:
+                close = float(parts[2])
+                kdate = datetime.strptime(parts[0], "%Y-%m-%d").date()
+                if close > 0:
+                    return close, kdate.isoformat()
+    except Exception:
+        pass
+
+    # ---- 兜底：腾讯日线（不走东财限流链路）----
+    sym = code.split(".")[0]
+    tencent_prefix = "sh" if sym.startswith(("5", "6", "9")) else "sz"
+    try:
+        resp = requests.get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": f"{tencent_prefix}{sym},day,,,10,qfq"},
+            headers=HTTP_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+        payload = resp.json().get("data", {}).get(f"{tencent_prefix}{sym}", {})
+        series = payload.get("qfqday") or payload.get("day") or []
+        if series:
+            last = series[-1]
+            close = float(last[2])
+            kdate = datetime.strptime(last[0], "%Y-%m-%d").date()
+            if close > 0:
+                return close, kdate.isoformat()
+    except Exception:
+        pass
+
+    return None
+
+
+def _fetch_jcs_full_series(code: str, metric: str) -> pd.DataFrame:
+    """韭圈儿完整序列（date, value），按日期升序。"""
+    payload = _json_get(
+        f"{JIUCAI_BASE}/index-valuation/history",
+        {"code": code, "metric": metric},
+        timeout=20,
+    )
+    series = pd.DataFrame(payload.get("series") or [])
+    if series.empty:
+        raise ValueError(f"{metric} 序列为空")
+    series["date"] = pd.to_datetime(series["date"], errors="coerce")
+    series["value"] = pd.to_numeric(series["value"], errors="coerce")
+    series = series.dropna().sort_values("date").reset_index(drop=True)
+    if series.empty:
+        raise ValueError(f"{metric} 序列无有效值")
+    return series
+
+
+def _rolling_update_value(
+    jc_series: pd.DataFrame, jc_close: float, em_close: float
+) -> tuple[float, float]:
+    """用东财/韭圈儿价格比滚动更新估值序列最新值，返回 (新值, 新5年分位%)。"""
+    ratio = em_close / jc_close
+    old_val = float(jc_series["value"].iloc[-1])
+    new_val = old_val * ratio
+    latest_date = jc_series["date"].iloc[-1]
+    window = jc_series.loc[
+        jc_series["date"] >= latest_date - pd.DateOffset(years=5), "value"
+    ]
+    extended = pd.concat([window, pd.Series([new_val])])
+    new_pct = float((extended < new_val).mean() * 100)
+    return round(new_val, 3), round(new_pct, 2)
+
+
 def _fetch_dividend_yield(code: str) -> float | None:
     """股息率（中证指数官网，月频）。仅中证编制的指数有数据，其余返回 None。"""
     sym, _, suffix = code.partition(".")
@@ -514,20 +628,84 @@ def _fetch_dividend_yield(code: str) -> float | None:
 
 
 def _fetch_valuation_metrics(item: dict[str, Any]) -> dict[str, Any]:
-    pe, pct, asof = _fetch_jcs_series(item["code"], "pe")
-    out: dict[str, Any] = {"pe": pe, "pct": pct, "asof": asof}
+    code = item["code"]
+    pe_series = _fetch_jcs_full_series(code, "pe")
+    pb_series: pd.DataFrame | None = None
     try:
-        pb, pb_pct, _ = _fetch_jcs_series(item["code"], "pb")
-        out["pb"] = pb
-        out["pb_pct"] = pb_pct
+        pb_series = _fetch_jcs_full_series(code, "pb")
     except Exception:
-        out["pb"] = None
-        out["pb_pct"] = None
-    out["dy"] = _fetch_dividend_yield(item["code"])
+        pass
+
+    latest_pe = float(pe_series["value"].iloc[-1])
+    jc_asof = pe_series["date"].iloc[-1].date().isoformat()
+    lag, stale = _check_asof_staleness(jc_asof)
+    est_flag = False
+
+    if stale:
+        em_info = _fetch_latest_close_em(code)
+        if em_info is not None:
+            em_close, em_date = em_info
+            try:
+                close_series = _fetch_jcs_full_series(code, "close")
+                jc_close = float(close_series["value"].iloc[-1])
+                jc_close_date = close_series["date"].iloc[-1].date().isoformat()
+            except Exception:
+                jc_close = 0.0
+                jc_close_date = jc_asof
+
+            if jc_close > 0 and em_close > 0 and em_date >= jc_close_date:
+                latest_pe, latest_pct = _rolling_update_value(pe_series, jc_close, em_close)
+                out: dict[str, Any] = {
+                    "pe": latest_pe, "pct": latest_pct, "asof": em_date,
+                    "est": True,
+                }
+                if pb_series is not None:
+                    latest_pb, latest_pb_pct = _rolling_update_value(pb_series, jc_close, em_close)
+                    out["pb"] = latest_pb
+                    out["pb_pct"] = latest_pb_pct
+                else:
+                    out["pb"] = None
+                    out["pb_pct"] = None
+                est_flag = True
+            else:
+                # 价格比无效（韭圈儿 close 也拿不到），退回原始分位
+                _, latest_pct, _ = _fetch_jcs_series(code, "pe")
+                out = {"pe": latest_pe, "pct": latest_pct, "asof": jc_asof, "est": False}
+                if pb_series is not None:
+                    _, latest_pb_pct, _ = _fetch_jcs_series(code, "pb")
+                    out["pb"] = float(pb_series["value"].iloc[-1])
+                    out["pb_pct"] = latest_pb_pct
+                else:
+                    out["pb"] = None
+                    out["pb_pct"] = None
+        else:
+            # 东财也失败，退回原始分位
+            _, latest_pct, _ = _fetch_jcs_series(code, "pe")
+            out = {"pe": latest_pe, "pct": latest_pct, "asof": jc_asof, "est": False}
+            if pb_series is not None:
+                _, latest_pb_pct, _ = _fetch_jcs_series(code, "pb")
+                out["pb"] = float(pb_series["value"].iloc[-1])
+                out["pb_pct"] = latest_pb_pct
+            else:
+                out["pb"] = None
+                out["pb_pct"] = None
+    else:
+        # 韭圈儿数据新鲜，直接用
+        _, latest_pct, _ = _fetch_jcs_series(code, "pe")
+        out = {"pe": latest_pe, "pct": latest_pct, "asof": jc_asof, "est": False}
+        if pb_series is not None:
+            _, latest_pb_pct, _ = _fetch_jcs_series(code, "pb")
+            out["pb"] = float(pb_series["value"].iloc[-1])
+            out["pb_pct"] = latest_pb_pct
+        else:
+            out["pb"] = None
+            out["pb_pct"] = None
+
+    out["dy"] = _fetch_dividend_yield(code)
     return out
 
 
-def _val_row_default(item: dict[str, Any], mode: str) -> dict[str, Any]:
+def _val_row_default(item: dict[str, Any], mode: str, asof: str | None = None) -> dict[str, Any]:
     return {
         "name": item["name"],
         "code": item["code"],
@@ -538,9 +716,24 @@ def _val_row_default(item: dict[str, Any], mode: str) -> dict[str, Any]:
         "pb": item.get("fallback_pb"),
         "pb_pct": item.get("fallback_pb_pct"),
         "dy": item.get("fallback_dy"),
-        "asof": FALLBACK_ASOF,
+        "asof": asof or FALLBACK_ASOF,
         "source": "demo" if mode == "demo" else "snapshot",
     }
+
+
+def _check_asof_staleness(asof_str: str) -> tuple[int, bool]:
+    """返回 (落后天数, 是否过期=落后>=1 天)。
+    
+    东财 push2his 收盘后 4-5 点就能刷到日线，韭圈儿估值偶尔晚 1-2 天。
+    只要落后 ≥1 天就触发东财价格比滚动更新尝试。
+    """
+    try:
+        asof = date.fromisoformat(asof_str)
+    except ValueError:
+        return 99, True
+    expected = _last_trading_day(date.today())
+    lag = (expected - asof).days
+    return lag, lag >= 1
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -549,12 +742,14 @@ def load_valuation(refresh_token: int, mode: str) -> tuple[list[dict[str, Any]],
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     live_count = 0
+    est_count = 0
+    expected_asof = _last_trading_day(date.today()).isoformat()
 
     if mode == "demo":
         rows = [_val_row_default(item, mode) for item in universe]
     else:
         def _job(item: dict[str, Any]) -> tuple[dict[str, Any], Exception | None]:
-            row = _val_row_default(item, mode)
+            row = _val_row_default(item, mode, asof=expected_asof)
             try:
                 row.update(_fetch_valuation_metrics(item))
                 row["source"] = "live"
@@ -568,26 +763,39 @@ def load_valuation(refresh_token: int, mode: str) -> tuple[list[dict[str, Any]],
         for (row, err), item in zip(results, universe):
             if err is None:
                 live_count += 1
+                if row.get("est"):
+                    est_count += 1
             else:
                 errors.append(f"{item['name']}: {_clip_error(err)}")
             rows.append(row)
 
     if mode == "demo":
         source = "演示数据"
-    elif live_count == len(universe):
+    elif live_count == len(universe) and est_count == 0:
         source = "实时估值"
-    elif live_count:
+    elif live_count == len(universe) and est_count > 0:
+        source = f"实时估值（东财滚动更新 {est_count}/{len(universe)}）"
+    elif live_count and est_count == 0:
         source = f"实时估值 {live_count}/{len(universe)} + 快照补位"
+    elif live_count and est_count > 0:
+        source = f"实时估值 {live_count}/{len(universe)}（东财滚动 {est_count}）+ 快照补位"
     else:
         source = "估值快照兜底"
 
-    asof = max((row["asof"] for row in rows), default=FALLBACK_ASOF)
+    asof = max((row["asof"] for row in rows), default=expected_asof)
+    lag, stale = _check_asof_staleness(asof)
+    # 如果有 est 行且 asof 已追上预期，不再标记 stale
+    has_fresh_est = est_count > 0 and lag == 0
     meta = {
         "source": source,
         "asof": asof,
+        "expected_asof": expected_asof,
+        "lag_days": lag,
+        "stale": stale and not has_fresh_est,
         "is_demo": mode == "demo",
         "errors": errors,
         "live_count": live_count,
+        "est_count": est_count,
     }
     return rows, meta
 
@@ -3230,10 +3438,13 @@ tech_drain_text = "、".join(
 valuation_dot = "demo" if valuation_meta["is_demo"] else "live"
 flow_dot = "demo" if flow_today_meta["is_demo"] else "live"
 support_dot = "demo" if support_meta["is_demo"] else "live"
+_lag = valuation_meta.get("lag_days", 0)
+_stale_cls = "dot demo" if valuation_meta.get("stale") else valuation_dot
+_stale_txt = f" · 落后{_lag}天（源端未刷新）" if valuation_meta.get("stale") else ""
 st.markdown(
     f"""
 <div class="statusbar">
-  <span class="status-chip"><span class="dot {valuation_dot}"></span>估值：{valuation_meta['source']} · {valuation_meta['asof']}</span>
+  <span class="status-chip"><span class="dot {_stale_cls}"></span>估值：{valuation_meta['source']} · {valuation_meta['asof']}{_stale_txt}</span>
   <span class="status-chip"><span class="dot {flow_dot}"></span>资金流：{flow_today_meta['source']} · {flow_today_meta['asof']}</span>
   <span class="status-chip"><span class="dot {support_dot}"></span>防线：{support_meta['source']} · {support_meta['asof']}</span>
   <span class="status-chip"><span class="dot"></span>事件：{event_source}</span>
