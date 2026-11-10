@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.4 · 2026-11-09"
+BUILD_TAG = "v4.5 · 2026-11-10"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -370,6 +370,17 @@ def _last_trading_day(day: date) -> date:
     while day.weekday() >= 5:
         day -= timedelta(days=1)
     return day
+
+
+def _trading_day_gap(start: date, end: date) -> int:
+    """start → end 之间的交易日数（仅剔除周末；长假会略微高估）。"""
+    gap = 0
+    cursor = start
+    while cursor < end:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            gap += 1
+    return gap
 
 
 def _clip_error(exc: Exception, limit: int = 120) -> str:
@@ -1427,8 +1438,40 @@ def _margin_points_from_series(stamps, values) -> list[dict[str, Any]]:
     ]
 
 
+def _fetch_margin_em() -> tuple[list[dict[str, Any]], str]:
+    """东财数据中心·沪深两市两融合计历史（RPTA_RZRQ_LSHJ）。
+
+    交易所 T+1 公布，东财次日早间入库；一次可取近半年，不用分页逐日请求。
+    """
+    payload = _json_get(
+        "https://datacenter-web.eastmoney.com/api/data/v1/get",
+        {
+            "reportName": "RPTA_RZRQ_LSHJ",
+            "columns": "DIM_DATE,RZRQYE",
+            "source": "WEB",
+            "sortColumns": "DIM_DATE",
+            "sortTypes": "-1",
+            "pageSize": "120",
+            "pageNumber": "1",
+        },
+        timeout=15,
+    )
+    rows = ((payload or {}).get("result") or {}).get("data") or []
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        raw_date = str(row.get("DIM_DATE") or "")[:10]
+        total = row.get("RZRQYE")
+        if len(raw_date) != 10 or total is None:
+            continue
+        points.append({"date": raw_date, "total": round(float(total) / 1e8, 2)})
+    points.sort(key=lambda item: item["date"])
+    if len(points) < 20:
+        raise ValueError("东财两融序列过短")
+    return points, "东财两融"
+
+
 def _fetch_margin_series() -> tuple[list[dict[str, Any]], str]:
-    """沪深两市两融余额（金十/交易所汇总），一次拿全历史，取最近3个月。"""
+    """沪深两市两融余额（金十），一次拿全历史，取最近3个月。"""
     if ak is None:
         raise ValueError("akshare 未安装")
     sh = _call_with_timeout(ak.macro_china_market_margin_sh, 15)
@@ -1505,7 +1548,11 @@ def load_margin(
     errors: list[str] = []
     points: list[dict[str, Any]] = []
     source = ""
-    for fetcher, label in ((_fetch_margin_series, "沪深两融"), (_fetch_margin_sse, "上交所两融")):
+    for fetcher, label in (
+        (_fetch_margin_em, "东财两融"),
+        (_fetch_margin_series, "沪深两融"),
+        (_fetch_margin_sse, "上交所两融"),
+    ):
         try:
             points, source = fetcher()
         except Exception as exc:
@@ -1516,8 +1563,16 @@ def load_margin(
     recent = [p for p in points if p["date"] >= cutoff][-62:]
     if len(recent) >= 20:
         _save_margin_cache(recent)
+        # 两融 T+1 公布：今天能看到的最新就是上一个交易日，比它更旧才算落后
+        expected_fresh = _last_trading_day(date.today() - timedelta(days=1))
+        try:
+            asof_date = date.fromisoformat(recent[-1]["date"])
+            lag = _trading_day_gap(asof_date, expected_fresh) if asof_date < expected_fresh else 0
+        except ValueError:
+            lag = 99
         return recent, {"source": source, "is_demo": False,
-                        "asof": recent[-1]["date"], "stale": False}
+                        "asof": recent[-1]["date"], "lag_days": lag,
+                        "stale": lag >= 1}
     cached = _load_margin_cache()
     if cached:
         return cached, {"source": "本地两融快照", "is_demo": False,
@@ -3202,9 +3257,9 @@ if "data_stamp" not in st.session_state:
     st.session_state.data_stamp = None
 
 if st.sidebar.button("刷新盘中数据", use_container_width=True):
-    # 只清盘中高频缓存（资金流/涨跌家数/ETF溢价/宏观），
-    # 日更数据（估值/科技防线/两融/ETF日线）当天已有缓存时继续复用。
-    for _cached_fn in (load_flow, load_breadth, load_etf_premium, load_macro):
+    # 清盘中高频缓存（资金流/涨跌家数/ETF溢价/宏观）+ 两融（单次请求，很轻）；
+    # 估值要从 17 个来源逐个拉，仍留给「全量刷新」。
+    for _cached_fn in (load_flow, load_breadth, load_etf_premium, load_macro, load_margin):
         try:
             _cached_fn.clear()
         except Exception:
@@ -3936,7 +3991,7 @@ with mid_col:
             unsafe_allow_html=True,
         )
         if not margin_points:
-            st.caption("两融数据暂不可用（交易所/金十接口限流），不影响其他模块；稍后点右上角刷新重试。")
+            st.caption("两融数据暂不可用（东财/交易所/金十接口限流），不影响其他模块；稍后点右上角刷新重试。")
         else:
             msig = margin_signal(margin_points)
             latest = margin_points[-1]
@@ -3994,10 +4049,13 @@ with mid_col:
                 f'{margin_alert(margin_points)["text"]}</div>',
                 unsafe_allow_html=True,
             )
-            st.caption(
+            _margin_caption = (
                 f"{margin_meta['source']} · {margin_meta['asof']}"
                 f"（{len(margin_points)} 个交易日，每日更新，不频繁请求）"
             )
+            if margin_meta.get("stale"):
+                _margin_caption += f" · ⚠️ 落后 {margin_meta.get('lag_days', '?')} 个交易日，源端尚未更新"
+            st.caption(_margin_caption)
 
 # ----------------------------- 03/04 事件与 AI ---------------------------
 with right_col:
