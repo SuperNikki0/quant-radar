@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.5 · 2026-11-10"
+BUILD_TAG = "v4.6 · 2026-11-11"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -113,6 +113,11 @@ EM_FLOW_DELAY_HOST = "https://push2delay.eastmoney.com"
 EM_FLOW_PATH = "/api/qt/clist/get"
 # 日线（K 线）接口主机，云端境外 IP 常被东财拒绝，失败后走腾讯/新浪兜底
 EM_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+# 板块历史日度主力净流入（本地资金流快照不足 3 日时回填高低切样本）
+EM_FLOW_HIST_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+# 回填失败后的重试冷却（秒），避免每次刷新都打 30+ 个历史请求
+_BACKFILL_RETRY_GAP = 900.0
+_backfill_attempt_at = 0.0
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1900,17 +1905,145 @@ def _demo_history() -> list[dict[str, Any]]:
     return history
 
 
+def _fetch_board_code_map() -> dict[str, str]:
+    """东财行业资金流排行 → {申万行业名: 板块代码}，与每日快照同一数据源。"""
+    wanted = set(SW_LEVEL1)
+    code_map: dict[str, str] = {}
+    for page in range(1, 7):
+        try:
+            payload = _json_get(
+                EM_FLOW_HOST + EM_FLOW_PATH,
+                {
+                    "pn": page, "pz": 100, "po": 1, "np": 1,
+                    "ut": "b2884a393a59ad64002292a3e90d46a5",
+                    "fltt": 2, "invt": 2, "fid0": "f62", "fs": "m:90+t:2",
+                    "stat": "1", "fields": "f12,f14",
+                },
+                timeout=10,
+            )
+        except Exception:
+            continue
+        rows = ((payload or {}).get("data") or {}).get("diff") or []
+        if not rows:
+            break
+        for row in rows:
+            name = str(row.get("f14") or "").strip()
+            code = str(row.get("f12") or "").strip()
+            if name in wanted and code.startswith("BK"):
+                code_map[name] = code
+        if len(code_map) >= len(wanted):
+            break
+    return code_map
+
+
+def _fetch_flow_hist_daykline(code: str, lmt: int = 8) -> list[tuple[str, float]]:
+    """单板块近 lmt 个交易日的日度主力净流入（单位：元，与每日快照一致）。"""
+    payload = _json_get(
+        EM_FLOW_HIST_URL,
+        {
+            "secid": f"90.{code}", "klt": 101, "lmt": lmt,
+            "fields1": "f1,f2,f3,f7", "fields2": "f51,f52",
+        },
+        timeout=8,
+    )
+    klines = ((payload or {}).get("data") or {}).get("klines") or []
+    series: list[tuple[str, float]] = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) >= 2:
+            try:
+                series.append((parts[0], float(parts[1])))
+            except ValueError:
+                continue
+    return series
+
+
+def _backfill_flow_history(
+    history: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """本地快照不足 3 日时，用东财板块历史日度主力净流入回填缺失的交易日。
+
+    返回 (合并后的历史, 是否发生了回填)。云端容器重建会清掉运行期写入的
+    快照文件，只靠本地积累永远凑不齐 3 日样本，必须能从数据源重建。
+    """
+    code_map = _fetch_board_code_map()
+    if len(code_map) < 20:
+        return history, False
+    calendar = [
+        d for d, _ in _fetch_flow_hist_daykline(next(iter(code_map.values())), lmt=8)
+    ]
+    have_map = {str(item.get("date")): item for item in history}
+    # 目标 = 缺失的日期 + 行业数不全的残缺日期（上次回填半途而废的也要补齐）
+    target_dates = [
+        d for d in calendar
+        if d not in have_map or len(have_map[d].get("flows", {})) < 25
+    ][-3:]
+    if not target_dates:
+        return history, False
+    per_day: dict[str, dict[str, float]] = {d: {} for d in target_dates}
+
+    def _job(item: tuple[str, str]) -> tuple[str, list[tuple[str, float]]]:
+        name, code = item
+        for attempt in range(2):
+            try:
+                return name, _fetch_flow_hist_daykline(code, lmt=8)
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.6)
+        return name, []
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for name, series in pool.map(_job, code_map.items()):
+            for d, value in series:
+                if d in per_day:
+                    per_day[d][name] = value
+
+    merged_map = {str(item.get("date")): item for item in history}
+    backfilled = False
+    for d, flows in per_day.items():
+        if len(flows) < 20:
+            continue
+        entry = merged_map.get(d)
+        if entry is None:
+            entry = {"date": d, "flows": {}}
+            merged_map[d] = entry
+        # 已有值优先（真实排行快照 > 回填值），只补缺
+        entry["flows"] = {**flows, **entry.get("flows", {})}
+        backfilled = True
+    merged = sorted(merged_map.values(), key=lambda item: str(item.get("date", "")))[-15:]
+    if backfilled:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            FLOW_HISTORY_FILE.write_text(
+                json.dumps({"snapshots": merged}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+    return merged, backfilled
+
+
 def get_flow_history(
     today_frame: pd.DataFrame, today_meta: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    global _backfill_attempt_at
     if today_meta.get("is_demo"):
         return _demo_history(), {
             "source": "演示三日样本",
             "is_demo": True,
         }
     history = _record_flow_snapshot(today_frame, today_meta)
+    backfilled = False
+    if len(history) < 3 and time.time() - _backfill_attempt_at > _BACKFILL_RETRY_GAP:
+        _backfill_attempt_at = time.time()
+        try:
+            history, backfilled = _backfill_flow_history(history)
+        except Exception:
+            backfilled = False
+            history = _load_history_file()
+    label = "本地快照+东财回填" if backfilled else "本地快照"
     return history, {
-        "source": f"本地快照 {len(history)} 日",
+        "source": f"{label} {len(history)} 日",
         "is_demo": False,
     }
 
