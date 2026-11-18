@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.6 · 2026-11-11"
+BUILD_TAG = "v4.7 · 2026-11-18"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -1285,34 +1285,127 @@ def _sw_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.copy()
 
 
-# ---- 市场宽度（涨停/跌停家数，全A本地统计）----
-BREADTH_FALLBACK = {
+# ---- 市场宽度（涨停/跌停家数，全A统计）----
+# 演示值只在 mode="demo" 下展示，真实模式绝不再用它冒充实时数据
+_BREADTH_DEMO = {
     "limit_up": 48, "limit_down": 12, "up": 2380, "down": 2650,
     "median": -0.21, "asof": "2026-11-05",
 }
+BREADTH_CACHE_FILE = DATA_DIR / "breadth_cache.json"
+BREADTH_ULIST_URL = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+BREADTH_POOL_URL = "https://push2ex.eastmoney.com"
+
+
+def _save_breadth_cache(payload: dict[str, Any]) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        BREADTH_CACHE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _load_breadth_cache() -> dict[str, Any] | None:
+    if not BREADTH_CACHE_FILE.exists():
+        return None
+    try:
+        return json.loads(BREADTH_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _fetch_breadth_em() -> dict[str, Any]:
+    """东财直连：ulist 拿涨跌家数（上证+深成自带全市场宽度），ZT/DT 池拿涨停跌停。"""
+    payload = _json_get(
+        BREADTH_ULIST_URL,
+        {
+            "fltt": "2", "invt": "2",
+            "fields": "f12,f14,f104,f105",
+            "secids": "1.000001,0.399001",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        },
+        timeout=12,
+    )
+    diff = ((payload or {}).get("data") or {}).get("diff") or []
+    up = down = 0
+    for item in diff:
+        up += int(item.get("f104") or 0)
+        down += int(item.get("f105") or 0)
+    if up + down < 100:
+        raise ValueError("ulist 涨跌家数异常")
+
+    today = date.today().strftime("%Y%m%d")
+    zt = dt = 0
+    for path, sort in (("getTopicZTPool", "fbt:asc"), ("getTopicDTPool", "fund:asc")):
+        try:
+            payload = _json_get(
+                f"{BREADTH_POOL_URL}/{path}",
+                {
+                    "ut": "7eea3edcaed734bea9cbfc24409ed989",
+                    "dpt": "wz.ztzt", "Pageindex": "0", "pagesize": "50",
+                    "sort": sort, "date": today,
+                },
+                timeout=10,
+            )
+            tc = ((payload or {}).get("data") or {}).get("tc")
+            if path == "getTopicZTPool":
+                zt = int(tc or 0)
+            else:
+                dt = int(tc or 0)
+        except Exception:
+            pass
+    return {"up": up, "down": down, "limit_up": zt, "limit_down": dt}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_breadth(refresh_token: int, mode: str) -> dict[str, Any]:
-    """涨停≈涨幅≥9.9%、跌停≈跌幅≤-9.9%（未区分20cm板块，近似值）。"""
-    if mode == "demo" or ak is None:
-        return {**BREADTH_FALLBACK, "source": "演示数据" if mode == "demo" else "快照"}
+    """市场宽度：涨停/跌停/上涨/下跌/中位涨幅。三层数据源 + 本地快照兜底。"""
+    if mode == "demo":
+        return {**_BREADTH_DEMO, "source": "演示数据"}
+
+    # 1) akshare 全 A 实时（能拿到精确中位涨幅）
+    if ak is not None:
+        try:
+            df = _call_with_timeout(ak.stock_zh_a_spot_em, 25)
+            chg = pd.to_numeric(df["涨跌幅"], errors="coerce").dropna()
+            if not chg.empty:
+                result = {
+                    "limit_up": int((chg >= 9.9).sum()),
+                    "limit_down": int((chg <= -9.9).sum()),
+                    "up": int((chg > 0).sum()),
+                    "down": int((chg < 0).sum()),
+                    "median": round(float(chg.median()), 2),
+                    "asof": date.today().isoformat(),
+                    "source": "东财全A",
+                }
+                _save_breadth_cache(result)
+                return result
+        except Exception:
+            pass
+
+    # 2) 东财直连 ulist + ZT/DT 池（中位涨幅拿不到，标 None）
     try:
-        df = _call_with_timeout(ak.stock_zh_a_spot_em, 25)
-        chg = pd.to_numeric(df["涨跌幅"], errors="coerce").dropna()
-        if chg.empty:
-            raise ValueError("empty")
-        return {
-            "limit_up": int((chg >= 9.9).sum()),
-            "limit_down": int((chg <= -9.9).sum()),
-            "up": int((chg > 0).sum()),
-            "down": int((chg < 0).sum()),
-            "median": round(float(chg.median()), 2),
-            "asof": date.today().isoformat(),
-            "source": "东财全A",
+        em = _fetch_breadth_em()
+        result = {
+            **em, "median": None,
+            "asof": date.today().isoformat(), "source": "东财宽度",
         }
+        _save_breadth_cache(result)
+        return result
     except Exception:
-        return {**BREADTH_FALLBACK, "source": "快照兜底"}
+        pass
+
+    # 3) 本地快照兜底（必须带 asof 日期，让用户知道陈旧程度）
+    cached = _load_breadth_cache()
+    if cached:
+        return {**cached, "source": f"快照 {cached.get('asof', '?')}"}
+
+    # 4) 全失败：宁可显示"暂不可用"，也不再假装有数据
+    return {
+        "limit_up": None, "limit_down": None, "up": None, "down": None,
+        "median": None, "asof": None, "source": "暂不可用",
+    }
 
 
 # ---- ETF 溢价率（东财 IOPV；取不到则显示"溢价 —"，绝不阻塞页面）----
@@ -3781,12 +3874,24 @@ with mid_col:
             unsafe_allow_html=True,
         )
         breadth = load_breadth(st.session_state.refresh_token, mode)
-        st.markdown(
-            f"""
-<div class="breadth-line">涨停 <b class="b-up">{breadth['limit_up']}</b> 家 · 跌停 <b class="b-down">{breadth['limit_down']}</b> 家 · 上涨/下跌 {breadth['up']}/{breadth['down']} · 中位涨幅 {breadth['median']:+.2f}%（{breadth['source']}）</div>
+        if breadth.get("up") is None:
+            # 全部数据源失败：宁可明确告诉用户，也不再显示假数据
+            st.markdown(
+                '<div class="breadth-line" style="color:#b56a2b;">市场宽度暂不可用（接口限流），点左侧「刷新盘中数据」重试</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            _lu = breadth["limit_up"] if breadth["limit_up"] is not None else "—"
+            _ld = breadth["limit_down"] if breadth["limit_down"] is not None else "—"
+            _median = (
+                f"{breadth['median']:+.2f}%" if breadth.get("median") is not None else "—"
+            )
+            st.markdown(
+                f"""
+<div class="breadth-line">涨停 <b class="b-up">{_lu}</b> 家 · 跌停 <b class="b-down">{_ld}</b> 家 · 上涨/下跌 {breadth['up']}/{breadth['down']} · 中位涨幅 {_median}（{breadth['source']}）</div>
 """,
-            unsafe_allow_html=True,
-        )
+                unsafe_allow_html=True,
+            )
         period = st.radio(
             "资金观察窗口",
             ["今日", "5日"],
