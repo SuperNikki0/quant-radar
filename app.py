@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.7 · 2026-11-18"
+BUILD_TAG = "v4.8 · 2026-11-20"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -275,7 +275,7 @@ def get_valuation_universe() -> list[dict[str, Any]]:
 FLOW_VALUATION_ALIAS = {"医药生物": "医疗"}
 FALLBACK_ASOF = "2026-11-05"
 
-# 科技防线：用近 20 个交易日低点作为第一支撑，支撑下破 5% 作为硬止损参考
+# 科技防线：用近 20 个交易日低点作为第一支撑，支撑下破 5% 作为风险参考位
 SUPPORT_UNIVERSE = [
     {
         "name": "科创50", "code": "000688.SH",
@@ -336,34 +336,34 @@ DEMO_BASE_FLOW = {
 }
 
 SYSTEM_PROMPT = """# Role
-你是拥有10年宏观对冲基金经验的首席量化风控官。服务对象是一位可用资金约6万元、重仓科技（半导体/通信）深套约40%、极易情绪化操作的A股个人投资者。
-风格要求：冷酷、客观、数据驱动，绝不说模棱两可的废话，不做情绪安慰。
+你是拥有10年宏观对冲基金经验的首席量化风控官。服务对象是一位重仓科技（半导体/通信）的A股个人投资者，希望获得客观、克制的风险观察。
+风格要求：客观、克制、数据驱动，不夸张、不制造恐慌，不做情绪化表达。
 
 # Workflow & Rules
-1. 宏观一票否决权：美债收益率大涨或人民币汇率急跌时，任何A股科技反弹都视为诱多，不得给出买入建议。
-2. 严防"死扛到底"：若科技ETF无量价企稳信号且资金持续流出，必须给出明确的减仓/防守警告，点名价位。
-3. 高低切寻宝：资金净流入Top5 与 极端低估（PE分位<20%）交集处的板块，才可列为"潜在线索"。
-4. 警惕价值陷阱：PE分位>80%的板块（如红利/银行/煤炭），即使资金流入，也必须提示"拥挤度过高，不建议追高"。
-5. 只使用【Context】中给出的数字，禁止编造行情、禁止预测具体点位。
+1. 宏观观察：美债收益率大涨或人民币汇率急跌时，提示A股科技反弹的持续性存疑，不做买入方向的建议。
+2. 科技为重点观察对象：结合科技ETF量价与资金流向，客观提示支撑位与风险区间，点名关键参考价位即可。
+3. 高低切寻宝：资金净流入Top5 与 极端低估（PE分位<20%）交集处的板块，可列为"观察线索"。
+4. 警惕价值陷阱：PE分位>80%的板块（如红利/银行/煤炭），即使资金流入，也提示"拥挤度偏高，追高性价比有限"。
+5. 只使用【Context】中给出的数字，不编造行情、不预测具体点位。
 
 # Output Format（严格按此顺序，不得增删小节）
 ### 【宏观定性】
-一句话总结当前宏观流动性与杠杆环境，直接给结论：利空科技 / 中性 / 宽松；并明确两融处于"出清中"还是"企稳"。
+一句话总结当前宏观流动性与杠杆环境，直接给结论：偏空科技 / 中性 / 宽松；并明确两融处于"出清中"还是"企稳"。
 
-### 【危险预警】
-针对深套的科技持仓，结合宏观、ETF异动、科技防线点位，给出可执行防守指令（必须含具体价位或比例）。
+### 【科技观察】
+针对科技持仓，结合宏观、ETF异动、科技防线点位，客观提示支撑位与风险区间（给出参考价位即可），语气克制。
 
 ### 【高低切雷达】
-- **避险区**：因拥挤度过高或估值极值而被资金抛弃/不宜追的板块。
-- **潜在线索**：1-2个 PE分位<20% 且资金正在流入的接力板块，必须附 PE分位与资金流入额。
+- **避险区**：因拥挤度偏高或估值极值而被资金抛弃/追高性价比有限的板块。
+- **观察线索**：1-2个 PE分位<20% 且资金正在流入的接力板块，附 PE分位与资金流入额。
 
-### 【今日执行纪律】
-3条简短、无情的操作铁律，每条都要可执行。
+### 【今日观察要点】
+3条简短的客观观察要点，每条尽量落到可验证的数据或价位。
 
 # Constraints
-- 严禁预测具体点位，一切依据系统数据。
-- 严禁建议重仓/满仓，必须为用户保留约6万元现金安全垫。
-- 语言精炼、直击痛点，全文不超过300字。"""
+- 不预测具体点位，一切依据系统数据。
+- 不做仓位与金额建议，不推荐重仓/满仓/加杠杆。
+- 语言精炼、客观克制，全文不超过300字。"""
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +444,7 @@ def _valuation_verdict(row: dict[str, Any]) -> tuple[str, str]:
     if pct >= 80:
         if dy is not None and dy >= 3.5:
             return ("5年最贵，只能靠股息兜底", "warn")
-        return ("5年最贵，绝不加仓", "bad")
+        return ("5年最贵，谨慎为上", "bad")
     if pct < 20:
         if pb_pct is not None and pb_pct >= 70:
             return ("PE低PB高，盈利强", "good")
@@ -1724,7 +1724,7 @@ def margin_alert(points: list[dict[str, Any]]) -> dict[str, str]:
 
     if latest > 28000 and chg5 > 0:
         return {"level": "red",
-                "text": "⚠️ 极度危险：杠杆资金极度拥挤且仍在狂奔，随时可能引发踩踏，严禁开新仓！"}
+                "text": "⚠️ 杠杆资金拥挤度很高，波动可能放大，追高性价比有限。"}
     if latest < 18000:
         return {"level": "green",
                 "text": "🟢 绝对地量：杠杆泡沫挤干，中长线黄金坑，逢低分批建仓。"}
@@ -2515,7 +2515,7 @@ def macro_signal(macro: dict[str, Any]) -> dict[str, str]:
         return {
             "level": "red",
             "title": "宏观流动性收紧",
-            "text": "美债收益率单日大涨 + 美元走强：极度利空纳指与A股高估值科技股，今日严禁追高科技。",
+            "text": "美债收益率单日大涨 + 美元走强：对纳指与A股高估值科技股构成压制，今日科技追高性价比有限。",
         }
     if cnh.get("pips", 0) > 150:
         return {
@@ -2535,7 +2535,7 @@ def macro_signal(macro: dict[str, Any]) -> dict[str, str]:
             "title": "避险模式开启",
             "text": "黄金大涨 + 美债收益率回落：留意持仓中黄金与红利的防御价值。",
         }
-    return {"level": "neutral", "title": "宏观中性", "text": "外围未出现极端信号，按资金与估值执行纪律。"}
+    return {"level": "neutral", "title": "宏观中性", "text": "外围未出现极端信号，按资金与估值客观观察。"}
 
 
 # ---------------------------------------------------------------------------
@@ -2697,9 +2697,6 @@ def build_ai_prompt(
     consec_inflows: list[dict[str, Any]],
     etf_anomalies: dict[str, tuple[pd.DataFrame, dict[str, Any]]],
     margin_points: list[dict[str, Any]],
-    total_capital: float,
-    tech_position: float,
-    cash: float,
 ) -> str:
     """把全市场原始表格用 Pandas 压缩成四块结构，再交给大模型。"""
     # ---- 1. 宏观与杠杆 ----
@@ -2793,8 +2790,8 @@ def build_ai_prompt(
    - 极端低估洼地（PE分位<20%）：{cheap_txt}
    - 低估且资金正在流入：{'；'.join(cheap_inflow)}
 
-【账户约束】总资金{total_capital:,.0f}元，科技深套约{tech_position:,.0f}元（约{tech_position / total_capital * 100 if total_capital else 0:.0f}%），可用现金约{cash:,.0f}元。
-【持仓明细】{holding_txt}
+【观察约束】科技板块为重点观察对象，只给支撑位与风险区间，不做仓位与金额建议。
+【持仓观察】{holding_txt}
 
 请严格按 Output Format 输出四个小节，全文不超过300字。"""
 
@@ -2812,8 +2809,6 @@ def build_local_conclusion(
     macro: dict[str, Any],
     msignal: dict[str, str],
     consec_inflows: list[dict[str, Any]],
-    tech_position: float,
-    cash: float,
     rebound_take_profit: float,
 ) -> str:
     elec = outflow[outflow["行业"].isin(TECH_FLOW_NAMES)]
@@ -2825,7 +2820,7 @@ def build_local_conclusion(
 
     # —— 宏观定性 ——
     if msignal["level"] == "red":
-        qual = f"外围压制明显：美债10Y {macro['us10y']['value']:.2f}%（{macro['us10y']['chg']:+.2f}%）叠加美元走强，高估值科技股承压，严禁追高。"
+        qual = f"外围压制明显：美债10Y {macro['us10y']['value']:.2f}%（{macro['us10y']['chg']:+.2f}%）叠加美元走强，高估值科技股承压，追高性价比有限。"
     elif msignal["level"] == "yellow":
         qual = f"汇率端承压：离岸人民币{macro['usdcnh'].get('pips', 0):+.0f}点，外资流向不利核心资产。"
     elif msignal["level"] == "green":
@@ -2833,22 +2828,22 @@ def build_local_conclusion(
     else:
         qual = "外围宏观中性，美元/美债/汇率均未出极端信号，主导权回到内部资金。"
 
-    # —— 危险预警 ——
+    # —— 科技观察（客观提示支撑位风险，不做仓位指令）——
     weakest = min(supports, key=lambda item: float(item["dist"]))
     if weakest["dist"] <= 0:
-        danger = f"{weakest['name']}已跌破20日支撑{weakest['low20']:.2f}，按纪律必须减半。"
+        danger = f"{weakest['name']}已跌破20日支撑{weakest['low20']:.2f}，支撑位失守后波动可能放大，留意后续量能。"
     elif weakest["dist"] <= 3:
-        danger = f"{weakest['name']}距20日支撑仅{weakest['dist']:.1f}%，收盘跌破{weakest['low20']:.2f}必须减半。"
+        danger = f"{weakest['name']}距20日支撑仅{weakest['dist']:.1f}%（{weakest['low20']:.2f}），已接近关键支撑，留意盘中变化。"
     else:
-        danger = f"{weakest['name']}距20日支撑{weakest['dist']:.1f}%，跌破{weakest['low20']:.2f}无条件减半。"
+        danger = f"{weakest['name']}距20日支撑{weakest['dist']:.1f}%（{weakest['low20']:.2f}），支撑位尚有余量。"
     if elec_text:
-        danger += f"{elec_text}，深套科技切勿补仓。"
+        danger += f"{elec_text}，科技资金面偏弱，留意支撑位表现。"
     hard_stops = [h for h in holdings if h["pnl_pct"] <= -8]
     if hard_stops:
         h = hard_stops[0]
-        danger += f"{h['name']}持仓{h['pnl_pct']:+.1f}%触发-8%硬止损参考，建议减半。"
+        danger += f"{h['name']}自成本回撤{h['pnl_pct']:+.1f}%，回撤幅度较大，关注支撑位与量能变化。"
     if msignal["level"] == "red":
-        danger += "美债飙升+科技流出共振，反弹即减仓。"
+        danger += "美债走强叠加科技资金流出，反弹力度或受限制。"
     if resonance["negatives"]:
         danger += f"双重利空：{resonance['negatives'][0]}临近。"
 
@@ -2858,7 +2853,7 @@ def build_local_conclusion(
         clue = "、".join(
             f"{c['name']}（分位{c['pct']:.0f}%、3日流入{_fmt_compact_yi(c['total'])}）" for c in leads[:2]
         )
-        clue += "——可纳入观察名单，等回踩不破再小仓试。"
+        clue += "——可纳入观察名单，等回踩不破再考虑小仓试。"
     elif opportunities:
         c = opportunities[0]
         clue = f"{c['name']}（PE分位{c['pct']:.1f}%、3日流入{_fmt_yi(c['three_day'])}）——可纳入观察名单。"
@@ -2867,28 +2862,27 @@ def build_local_conclusion(
     crowded = [r for r in valuation_rows if r["pct"] >= 80]
     avoid = "、".join(f"{r['name']}(分位{r['pct']:.0f}%)" for r in crowded[:3]) or "无极端高估板块"
 
-    # —— 今日执行纪律 ——
-    reduce_amt = tech_position * 0.2
+    # —— 今日观察要点 ——
     below = [r["name"] for r in supports if not r["above_ma5"]]
     rules = [
-        f"不买科技：{'、'.join(below) + '在5日线下方，' if below else ''}未见放量企稳，禁止补仓。",
-        f"科技反弹超{rebound_take_profit:.0f}%先减约{reduce_amt:,.0f}元，跌破20日支撑无条件减半。",
-        f"现金{cash:,.0f}元保持不动，不满仓、不加杠杆。",
+        f"科技以观察为主：{'、'.join(below) + '仍在5日线下方，' if below else ''}等待量价企稳信号。",
+        f"若科技反弹超过{rebound_take_profit:.0f}%，可结合自身计划分批处理；跌破20日支撑则下调风险预期。",
+        "保持分散与流动性，不加杠杆、不满仓。",
     ]
     if msignal["level"] == "red":
-        rules[0] = "外围风偏极差，今日科技一律不买，反弹只减不加。"
+        rules[0] = "外围风偏偏弱，今日科技以观察为主，不追高。"
     upcoming = [e for e in events if _event_days(e) >= 0]
     if upcoming:
         nearest = min(upcoming, key=_event_days)
-        rules.append(f"盯防{_event_days(nearest)}天后的{nearest['title']}，事件前不重仓。")
+        rules.append(f"盯防{_event_days(nearest)}天后的{nearest['title']}，事件前保持轻仓观察。")
 
     return (
         f"### 【宏观定性】\n{qual}\n\n"
-        f"### 【危险预警】\n{danger}\n\n"
+        f"### 【科技观察】\n{danger}\n\n"
         f"### 【高低切雷达】\n"
-        f"- **避险区**：{avoid}——拥挤度过高，不建议追高。\n"
-        f"- **潜在线索**：{clue}\n\n"
-        f"### 【今日执行纪律】\n"
+        f"- **避险区**：{avoid}——拥挤度偏高，追高性价比有限。\n"
+        f"- **观察线索**：{clue}\n\n"
+        f"### 【今日观察要点】\n"
         + "\n".join(f"{idx}. {rule}" for idx, rule in enumerate(rules[:3], start=1))
     )
 
@@ -3386,48 +3380,32 @@ signal_mode_label = st.sidebar.radio(
 signal_mode = "分位" if signal_mode_label.startswith("历史") else "绝对"
 
 st.sidebar.checkbox(
-    "顶部显示资金概览",
+    "顶部显示观察概览",
     value=False,
     key="show_header",
-    help="默认关闭（低调模式）。开启后页头显示总资金/科技仓位/可用子弹。",
+    help="默认关闭（低调模式）。开启后页头显示观察重点标签，不含任何金额。",
 )
 
 st.sidebar.divider()
-st.sidebar.markdown("**账户约束**")
-total_capital = st.sidebar.number_input(
-    "总可投资金（元）", min_value=0.0, value=100_000.0, step=10_000.0, format="%.0f"
-)
-tech_position = st.sidebar.number_input(
-    "科技深套市值（元）", min_value=0.0, value=40_000.0, step=5_000.0, format="%.0f"
-)
-cash = max(total_capital - tech_position, 0.0)
-st.sidebar.caption(f"可用子弹约 ¥{cash:,.0f} · 科技仓位占比 {tech_position / total_capital * 100 if total_capital else 0:.1f}%")
-
+st.sidebar.markdown("**观察设置**")
 rebound_take_profit = st.sidebar.slider(
-    "反弹做 T 阈值（%）", min_value=1, max_value=6, value=3, step=1,
-    help="深套科技仓位反弹达到该幅度，按纪律减 1/5。",
+    "反弹观察阈值（%）", min_value=1, max_value=6, value=3, step=1,
+    help="科技反弹达到该幅度时，作为一个观察节点提示。",
 )
 
 with st.sidebar.expander("我的持仓（选填 · 盈亏监控）", expanded=False):
-    st.caption("成本按对应指数点位填写，系统按现价估算盈亏")
+    st.caption("只填指数名称与成本点位，系统按现价估算盈亏百分比，不记录任何金额。")
     holding_inputs: list[dict[str, Any]] = []
     for i in range(3):
         h_name = st.selectbox(
             f"持仓 {i+1}", ["—", "科创50", "科创芯片", "通信"], key=f"h_name_{i}"
         )
-        hc1, hc2 = st.columns(2)
-        with hc1:
-            h_cost = st.number_input(
-                f"成本点位 {i+1}", min_value=0.0, value=0.0, step=10.0,
-                format="%.2f", key=f"h_cost_{i}",
-            )
-        with hc2:
-            h_amt = st.number_input(
-                f"市值(元) {i+1}", min_value=0.0, value=0.0, step=1000.0,
-                format="%.0f", key=f"h_amt_{i}",
-            )
-        if h_name != "—" and h_cost > 0 and h_amt > 0:
-            holding_inputs.append({"name": h_name, "cost": h_cost, "amount": h_amt})
+        h_cost = st.number_input(
+            f"成本点位 {i+1}", min_value=0.0, value=0.0, step=10.0,
+            format="%.2f", key=f"h_cost_{i}",
+        )
+        if h_name != "—" and h_cost > 0:
+            holding_inputs.append({"name": h_name, "cost": h_cost})
 
 st.sidebar.divider()
 _saved_cfg = load_config()
@@ -3510,7 +3488,7 @@ st.sidebar.markdown(
 资金流：AkShare / 东方财富行业资金流<br>
 事件：代码内置或 events.json<br><br>
 <b>纪律</b><br>
-不追高 · 深套不补仓 · 分批网格 · 破位减半
+不追高 · 关注支撑 · 分批观察 · 留意量能
 </div>
 """,
     unsafe_allow_html=True,
@@ -3533,11 +3511,9 @@ msignal = macro_signal(macro)
 
 _hero_pills = ""
 if st.session_state.get("show_header"):
-    _hero_pills = f"""
-    <span class="pill">总资金 <b>¥{total_capital:,.0f}</b></span>
-    <span class="pill">科技深套 <b>¥{tech_position:,.0f}</b></span>
-    <span class="pill">可用子弹 <b>¥{cash:,.0f}</b></span>
-    <span class="pill">纪律 <b>破位即减</b></span>"""
+    _hero_pills = """
+    <span class="pill">科技 <b>重点观察</b></span>
+    <span class="pill">纪律 <b>关注支撑位</b></span>"""
 st.markdown(
     f"""
 <div class="hero">
@@ -3805,7 +3781,7 @@ with left_col:
         if gap_pp >= 20:
             gap_note = "结论：科技组估值分位显著高于低位组，回调风险未释放完毕，低位组性价比凸显。"
         elif gap_pp <= -20:
-            gap_note = "结论：科技组估值分位已低于低位组，属“便宜但深套”，仍需等资金右侧信号再补仓。"
+            gap_note = "结论：科技组估值分位已低于低位组，属“便宜但深套”，仍需等资金右侧信号。"
         else:
             gap_note = "结论：两组估值分位接近，性价比差距不大，轮动以资金流信号为准。"
         st.markdown(
@@ -4303,7 +4279,7 @@ with right_col:
             """
 <div class="section-kicker">03 / AI DECISION</div>
 <div class="section-title" style="font-size:1.08rem;">AI 量化交易结论</div>
-<div class="section-sub">剥离情绪 · 只输出条件、价位与动作</div>
+<div class="section-sub">剥离情绪 · 客观输出支撑位、风险区间与观察要点</div>
 """,
             unsafe_allow_html=True,
         )
@@ -4319,9 +4295,6 @@ with right_col:
             consec_inflows=consec_inflows,
             etf_anomalies=etf_anomalies,
             margin_points=margin_points,
-            total_capital=total_capital,
-            tech_position=tech_position,
-            cash=cash,
         )
 
         if api_key:
@@ -4340,8 +4313,7 @@ with right_col:
                 conclusion = build_local_conclusion(
                     valuation_rows, inflow_today, outflow_today, rotation,
                     supports, opportunities, holdings, resonance, events,
-                    macro, msignal, consec_inflows,
-                    tech_position, cash, rebound_take_profit,
+                    macro, msignal, consec_inflows, rebound_take_profit,
                 )
                 ai_source = "本地规则引擎（大模型调用失败）"
                 ai_error = _clip_error(exc, 180)
@@ -4349,8 +4321,7 @@ with right_col:
             conclusion = build_local_conclusion(
                 valuation_rows, inflow_today, outflow_today, rotation,
                 supports, opportunities, holdings, resonance, events,
-                macro, msignal, consec_inflows,
-                tech_position, cash, rebound_take_profit,
+                macro, msignal, consec_inflows, rebound_take_profit,
             )
             ai_source = "本地规则引擎（未配置 API Key）"
             ai_error = ""
@@ -4363,7 +4334,7 @@ with right_col:
 <div class="ai-panel">
   <div class="ai-meta">{ai_source}</div>
   <div class="ai-body">{_ai_html(conclusion)}</div>
-  <div class="ai-local">结论来自规则/模型，不构成投资建议；破位纪律优先于任何观点。</div>
+  <div class="ai-local">结论来自规则/模型，不构成投资建议；支撑位观察优先于任何观点。</div>
 </div>
 """,
             unsafe_allow_html=True,
@@ -4447,14 +4418,14 @@ with right_col:
             """
 <div class="section-kicker">RISK LINE / SUPPORT</div>
 <div class="section-title" style="font-size:1.08rem;">科技防线</div>
-<div class="section-sub">20 日低点=第一支撑；跌破后减半，支撑下 5%=硬止损</div>
+<div class="section-sub">20 日低点=第一支撑；跌破后关注风险扩散，支撑下 5% 为风险参考位</div>
 """,
             unsafe_allow_html=True,
         )
         support_html = []
         for row in supports:
             if row["dist"] <= 0:
-                status, cls = "破位·执行减半", "broken"
+                status, cls = "破位·关注风险", "broken"
             elif row["dist"] <= 3:
                 status, cls = "贴近·盯紧", "near"
             else:
@@ -4495,7 +4466,7 @@ with right_col:
             """
 <div class="section-kicker" style="margin-top:12px;">MY POSITIONS</div>
 <div class="section-title" style="font-size:1.08rem;">持仓盈亏监控</div>
-<div class="section-sub">左侧边栏录入成本点位 · 跌幅≤-8% 触发硬止损参考</div>
+<div class="section-sub">左侧边栏录入成本点位 · 回撤加深时提示支撑风险</div>
 """,
             unsafe_allow_html=True,
         )
@@ -4503,19 +4474,19 @@ with right_col:
             st.markdown(
                 f"""
 <div class="alert-card trigger">
-  <b>⚠️ 资金抽血警告</b><br>
-  {tech_drain_text}，你的科技持仓正面临抛压，<b>请勿补仓</b>；反弹按纪律做T减仓。
+  <b>⚠️ 资金面提示</b><br>
+  {tech_drain_text}，科技板块资金面偏弱，留意支撑位表现。
 </div>
 """,
                 unsafe_allow_html=True,
             )
         if not holdings:
-            st.caption("未录入持仓。在左侧边栏「我的持仓」填写指数成本点位与市值后，这里会实时显示盈亏与止损信号。")
+            st.caption("未录入持仓。在左侧边栏「我的持仓」填写指数成本点位后，这里会显示盈亏百分比与支撑风险提示。")
         else:
             holding_html = []
             for h in holdings:
                 if h["pnl_pct"] <= -8:
-                    badge, cls = "硬止损参考 · 减半", "broken"
+                    badge, cls = "回撤较大 · 关注支撑", "broken"
                 elif h["pnl_pct"] <= -3:
                     badge, cls = "警戒", "near"
                 else:
@@ -4536,8 +4507,7 @@ with right_col:
                 + "".join(holding_html),
                 unsafe_allow_html=True,
             )
-            total_pnl_amt = sum(h["amount"] * h["pnl_pct"] / 100 for h in holdings)
-            st.caption(f"持仓浮动盈亏估算：{total_pnl_amt:+,.0f} 元（按指数点位线性估算，仅供参考）")
+            st.caption("盈亏百分比按指数点位线性估算，仅供参考。")
 
 # ----------------------------- 02 资金流 ---------------------------------
 
