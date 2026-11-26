@@ -53,7 +53,7 @@ FLOW_HISTORY_FILE = DATA_DIR / "flow_history.json"
 FLOW_5D_CACHE_FILE = DATA_DIR / "flow_5d_cache.json"
 EVENTS_FILE = BASE_DIR / "events.json"
 CONFIG_FILE = DATA_DIR / "config.json"
-BUILD_TAG = "v4.8 · 2026-11-20"
+BUILD_TAG = "v4.9 · 2026-11-26"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -514,37 +514,36 @@ def _fetch_jcs_series(code: str, metric: str) -> tuple[float, float, str]:
     return round(latest, 3), round(pct_5y, 2), latest_date.date().isoformat()
 
 
-def _jcs_code_to_em_secid(code: str) -> str | None:
-    """韭圈儿 code → 东财 push2 secid。海外/申万指数东财无覆盖，返回 None。"""
+def _em_secid_candidates(code: str) -> list[str]:
+    """韭圈儿 code → 东财 secid 候选（按可能性排序）。海外/申万指数无覆盖，返回空。
+
+    东财 push2 的市场前缀：1=沪市，0=深市，2=中证指数公司指数。
+    中证系列（000922 中证红利、93xxxx 行业主题）多数挂在 2. 下，仅试 1./0.
+    会取到同名不同标的，价格量级差几个数量级，必须多试。
+    """
     sym, _, suffix = code.partition(".")
     if suffix in ("HI", "GI", "SI"):
-        return None  # 恒生/美股/申万行业 → 东财无对应指数，跳过滚动更新
+        return []
     if suffix == "SH":
-        return f"1.{sym}"
+        return [f"1.{sym}"]
     if suffix == "SZ":
-        return f"0.{sym}"
-    # CSI：看代码前缀判断沪/深
+        return [f"0.{sym}"]
     if suffix == "CSI":
+        if sym.startswith("399"):
+            return [f"0.{sym}"]
         if sym.startswith(("000", "51", "52", "53", "56")):
-            return f"1.{sym}"  # 沪市 ETF / 宽基
-        if sym.startswith(("399", "15", "16")):
-            return f"0.{sym}"  # 深市 ETF / 宽基
-        if sym.startswith("93"):
-            return f"0.{sym}"  # 中证行业指数多深市
-        return f"1.{sym}"  # 默认沪市
-    return f"1.{sym}"  # fallback
+            return [f"1.{sym}", f"2.{sym}"]
+        return [f"2.{sym}", f"1.{sym}", f"0.{sym}"]
+    return [f"1.{sym}"]
 
 
-def _fetch_latest_close_em(code: str) -> tuple[float, str] | None:
-    """东财 push2 拉指数最新 (收盘价, 日期ISO)。海外指数/无覆盖时返回 None。
-    
-    两层数据源：push2his 主路 → 腾讯日线兜底（腾讯不走东财 push2 限流链路，更稳）。
-    """
-    secid = _jcs_code_to_em_secid(code)
-    if secid is None:
-        return None
+# 指数点位与韭圈儿 close 的允许偏差：两源相差 1-2 个交易日也远小于此区间
+_CLOSE_RATIO_MIN = 0.92
+_CLOSE_RATIO_MAX = 1.09
 
-    # ---- 主路：东财 push2his ----
+
+def _kline_close_em(secid: str) -> tuple[float, str] | None:
+    """东财 push2his 单 secid 最新收盘 (close, dateISO)。"""
     try:
         beg = (date.today() - timedelta(days=12)).strftime("%Y%m%d")
         end = date.today().strftime("%Y%m%d")
@@ -560,15 +559,37 @@ def _fetch_latest_close_em(code: str) -> tuple[float, str] | None:
             timeout=10,
         )
         klines = ((payload or {}).get("data") or {}).get("klines") or []
-        if klines:
-            parts = klines[-1].split(",")
-            if len(parts) >= 3:
-                close = float(parts[2])
-                kdate = datetime.strptime(parts[0], "%Y-%m-%d").date()
-                if close > 0:
-                    return close, kdate.isoformat()
+        if not klines:
+            return None
+        parts = klines[-1].split(",")
+        if len(parts) < 3:
+            return None
+        close = float(parts[2])
+        if close <= 0:
+            return None
+        kdate = datetime.strptime(parts[0], "%Y-%m-%d").date()
+        return close, kdate.isoformat()
     except Exception:
-        pass
+        return None
+
+
+def _fetch_latest_close_em(
+    code: str, ref_close: float | None = None
+) -> tuple[float, str] | None:
+    """指数最新 (收盘价, 日期ISO)。
+
+    传入 ref_close（韭圈儿 close）时，只接受量级一致的标的，防止 secid 映射
+    错误把估值序列整体缩放坏。三层：东财各候选 secid → 腾讯日线。
+    """
+    def _ok(close: float) -> bool:
+        if ref_close is None or ref_close <= 0:
+            return True
+        return _CLOSE_RATIO_MIN <= close / ref_close <= _CLOSE_RATIO_MAX
+
+    for secid in _em_secid_candidates(code):
+        got = _kline_close_em(secid)
+        if got is not None and _ok(got[0]):
+            return got
 
     # ---- 兜底：腾讯日线（不走东财限流链路）----
     sym = code.split(".")[0]
@@ -586,7 +607,7 @@ def _fetch_latest_close_em(code: str) -> tuple[float, str] | None:
             last = series[-1]
             close = float(last[2])
             kdate = datetime.strptime(last[0], "%Y-%m-%d").date()
-            if close > 0:
+            if close > 0 and _ok(close):
                 return close, kdate.isoformat()
     except Exception:
         pass
@@ -614,11 +635,23 @@ def _fetch_jcs_full_series(code: str, metric: str) -> pd.DataFrame:
 
 def _rolling_update_value(
     jc_series: pd.DataFrame, jc_close: float, em_close: float
-) -> tuple[float, float]:
-    """用东财/韭圈儿价格比滚动更新估值序列最新值，返回 (新值, 新5年分位%)。"""
+) -> tuple[float, float] | None:
+    """用东财/韭圈儿价格比滚动更新估值序列最新值，返回 (新值, 新5年分位%)。
+
+    任一环节不合理就返回 None，调用方回退韭圈儿原值——宁可少更新一天，
+    也不能把估值分位算错。
+    """
+    if jc_close <= 0 or em_close <= 0:
+        return None
     ratio = em_close / jc_close
+    if not (_CLOSE_RATIO_MIN <= ratio <= _CLOSE_RATIO_MAX):
+        return None
     old_val = float(jc_series["value"].iloc[-1])
+    if old_val <= 0:
+        return None
     new_val = old_val * ratio
+    if not (0 < new_val < 1000):
+        return None
     latest_date = jc_series["date"].iloc[-1]
     window = jc_series.loc[
         jc_series["date"] >= latest_date - pd.DateOffset(years=5), "value"
@@ -658,44 +691,45 @@ def _fetch_valuation_metrics(item: dict[str, Any]) -> dict[str, Any]:
     est_flag = False
 
     if stale:
-        em_info = _fetch_latest_close_em(code)
-        if em_info is not None:
-            em_close, em_date = em_info
-            try:
-                close_series = _fetch_jcs_full_series(code, "close")
-                jc_close = float(close_series["value"].iloc[-1])
-                jc_close_date = close_series["date"].iloc[-1].date().isoformat()
-            except Exception:
-                jc_close = 0.0
-                jc_close_date = jc_asof
+        # 先拿韭圈儿自身 close 作为量级基准，再校验东财/腾讯点位
+        try:
+            close_series = _fetch_jcs_full_series(code, "close")
+            jc_close = float(close_series["value"].iloc[-1])
+            jc_close_date = close_series["date"].iloc[-1].date().isoformat()
+        except Exception:
+            jc_close = 0.0
+            jc_close_date = jc_asof
 
-            if jc_close > 0 and em_close > 0 and em_date >= jc_close_date:
-                latest_pe, latest_pct = _rolling_update_value(pe_series, jc_close, em_close)
-                out: dict[str, Any] = {
-                    "pe": latest_pe, "pct": latest_pct, "asof": em_date,
-                    "est": True,
-                }
-                if pb_series is not None:
-                    latest_pb, latest_pb_pct = _rolling_update_value(pb_series, jc_close, em_close)
-                    out["pb"] = latest_pb
-                    out["pb_pct"] = latest_pb_pct
-                else:
-                    out["pb"] = None
-                    out["pb_pct"] = None
-                est_flag = True
+        rolled = None
+        em_date = ""
+        if jc_close > 0:
+            em_info = _fetch_latest_close_em(code, ref_close=jc_close)
+            if em_info is not None:
+                em_close, em_date = em_info
+                if em_date >= jc_close_date:
+                    rolled = _rolling_update_value(pe_series, jc_close, em_close)
+
+        if rolled is not None:
+            latest_pe, latest_pct = rolled
+            out: dict[str, Any] = {
+                "pe": latest_pe, "pct": latest_pct, "asof": em_date,
+                "est": True,
+            }
+            pb_rolled = (
+                _rolling_update_value(pb_series, jc_close, em_close)
+                if pb_series is not None else None
+            )
+            if pb_rolled is not None:
+                out["pb"], out["pb_pct"] = pb_rolled
+            elif pb_series is not None:
+                out["pb"] = float(pb_series["value"].iloc[-1])
+                _, out["pb_pct"], _ = _fetch_jcs_series(code, "pb")
             else:
-                # 价格比无效（韭圈儿 close 也拿不到），退回原始分位
-                _, latest_pct, _ = _fetch_jcs_series(code, "pe")
-                out = {"pe": latest_pe, "pct": latest_pct, "asof": jc_asof, "est": False}
-                if pb_series is not None:
-                    _, latest_pb_pct, _ = _fetch_jcs_series(code, "pb")
-                    out["pb"] = float(pb_series["value"].iloc[-1])
-                    out["pb_pct"] = latest_pb_pct
-                else:
-                    out["pb"] = None
-                    out["pb_pct"] = None
+                out["pb"] = None
+                out["pb_pct"] = None
+            est_flag = True
         else:
-            # 东财也失败，退回原始分位
+            # 价格比不可信 / 东财不可达：退回韭圈儿原始值与原始分位
             _, latest_pct, _ = _fetch_jcs_series(code, "pe")
             out = {"pe": latest_pe, "pct": latest_pct, "asof": jc_asof, "est": False}
             if pb_series is not None:
@@ -3725,7 +3759,7 @@ with left_col:
             """
 <div class="section-kicker">01 / VALUATION</div>
 <div class="section-title">核心持仓估值水位</div>
-<div class="section-sub">PE 近5年分位定高低：&lt;20% 低估(绿) · &gt;80% 高估(红) · 韭圈儿整体法口径</div>
+<div class="section-sub">PE 近5年分位定高低：&lt;20% 低估(绿) · &gt;80% 高估(红) · 韭圈儿整体法口径（上市不足5年按可得样本）</div>
 """,
             unsafe_allow_html=True,
         )
